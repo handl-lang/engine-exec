@@ -1,0 +1,12 @@
+[package]
+name = "handl-plugin-engine-exec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+handl-language = {path = "../handl-language" }
+handl-platform = {path = "../platform" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+handl-plugin-module = {path = "../plugin-module" }
