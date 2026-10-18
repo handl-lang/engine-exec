@@ -1,17 +1,28 @@
 [package]
-name = "handl-plugin-engine-exec"
-version.workspace = true
-edition.workspace = true
+name = "hnl-engine-exec"
+version = "0.1.0"
+edition = "2024"
 description = "The **abstraction** crate for the eval operation (ADR-0044 §3, §4, §7)."
-license.workspace = true
-repository.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/handl-lang/engine-exec"
 
 [dependencies]
-handl-language = { workspace = true }
-handl-platform = { path = "../platform" }
-handl-value = { workspace = true }
-serde_json = { workspace = true }
+handl-language = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+handl-platform = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+serde_json = "1"
 rustc-hash = "2"
 
 [dev-dependencies]
-handl-plugin-module = { path = "../plugin-module" }
+handl-plugin-module = { git = "https://github.com/handl-lang/platform", branch = "main" }
+
+[patch."https://github.com/handl-lang/engine"]
+hnl-engine = { path = "../engine" }
+
+[patch."https://github.com/handl-lang/kernel"]
+handl-language = { path = "../kernel/crates/handl-language" }
+handl-value = { path = "../kernel/crates/handl-value" }
+
+[patch."https://github.com/handl-lang/platform"]
+handl-platform = { path = "../platform/crates/platform" }
+handl-plugin-module = { path = "../platform/crates/plugin-module" }

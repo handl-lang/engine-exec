@@ -1,9 +1,9 @@
-//! # handl-plugin-engine-exec
+//! # hnl-engine-exec
 //!
 //! The **abstraction** crate for the eval operation (ADR-0044 §3, §4, §7).
 //!
 //! Splits `plugin-ext-eval` into an abstraction (operation marker + trait,
-//! no engine) and an engine crate (`plugin-engine-exec-tree-walk`). This
+//! no engine) and an engine crate (`hnl-engine-exec-tree-walk`). This
 //! crate defines the `Eval` operation marker, [`EvalRequest`], the
 //! [`EvalEngine`] trait. `Foreign` scheme dispatch uses
 //! [`handl_platform::ModuleLookup`]/[`handl_platform::Function`] from the
@@ -136,7 +136,7 @@ pub trait EvalEngine {
     /// [`with_global`](Self::with_global), then delegate to
     /// [`eval_shared`](Self::eval_shared). Engines that can bind per-call
     /// names directly on the call frame (e.g. the tree-walk engine's
-    /// [`ScopeStack`](plugin_engine_exec_tree_walk::ScopeStack)) override
+    /// [`ScopeStack`](hnl_engine_exec_tree_walk::ScopeStack)) override
     /// this for a zero-clone path. The default preserves the existing
     /// fallback behavior for engines that do not override it.
     ///
