@@ -54,7 +54,6 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "hnl-engine"
 version = "0.1.0"
-source = "git+https://github.com/handl-lang/engine?branch=main#c0a2087f16473d73025d26752de513943b2f71cf"
 dependencies = [
  "handl-value",
  "serde",
