@@ -300,6 +300,16 @@ fn try_array_pattern(
 /// string); the entry's value is a sub-pattern matched against the
 /// corresponding field. A `...rest` element captures the unmatched keys
 /// as an object.
+///
+/// The scrutinee's object test is the tagged-object view
+/// ([`TaggedValue::object_view`], ADR-0083 §2.1): an `Obj` destructures
+/// directly, and the *opaque* variants (`Tensor`/`Bytes`/`Sym`/
+/// `Resource`) destructure through their canonical `{"__x__": …}` wire
+/// record — a `{ "__tensor__": inner }` pattern matches a kernel
+/// `Tensor` exactly as it matches a `.hnl`-authored wire record. The
+/// binders see the *record* fields (shape/data/dtype), never the opaque
+/// variant. Variants with their own `.hnl` projections
+/// (`Pair`/`Either`/`Arrow`) and scalars do not match.
 fn try_object_pattern(
     ast: &Ast,
     pattern_ref: AstRef,
@@ -317,9 +327,19 @@ fn try_object_pattern(
                 &pattern_node,
             )
         })?;
+    // The scrutinee's fields, via the tagged-object view: `Obj`
+    // destructures in place; an opaque variant's wire record
+    // materializes (held by `view` for the borrow's scope).
+    let view;
     let scrut_obj = match scrut {
         TaggedValue::Obj(o) => o,
-        _ => return Ok(false),
+        _ => {
+            view = scrut.object_view();
+            match &view {
+                Some(TaggedValue::Obj(o)) => o,
+                _ => return Ok(false),
+            }
+        }
     };
 
     // Separate entries from the optional rest pattern.

@@ -184,6 +184,26 @@ pub fn type_tag(v: &TaggedValue) -> &'static str {
     }
 }
 
+/// The field map a value *presents* to `.hnl` object operations — the
+/// shared record-destructuring gate (the tagged-object view,
+/// ADR-0083 §2.1).
+///
+/// [`TaggedValue::object_view`] materializes the canonical
+/// `{"__x__": …}` wire record of the *opaque* variants
+/// (`Tensor`/`Bytes`/`Sym`/`Resource`), so `is_obj`/`has_field`/
+/// `field_access`/`index`/`obj_except`/`opt_chain`/object spread read
+/// an opaque value exactly as they read a `.hnl`-authored record with
+/// the same encoding — the two are the same *value* on the wire, and
+/// the same observation in the language. Variants with their own
+/// `.hnl` projections (`Pair`/`Either`/`Arrow`) and scalars return
+/// `None`.
+fn view_fields(v: &TaggedValue) -> Option<Rc<FxHashMap<Rc<str>, TaggedValue>>> {
+    match v.object_view() {
+        Some(TaggedValue::Obj(map)) => Some(map),
+        _ => None,
+    }
+}
+
 // ===========================================================================
 // Numeric helpers (moved from the 3 backend copies)
 // ===========================================================================
@@ -1227,7 +1247,7 @@ pub fn apply_native_op(
         "record_merge" => {
             let mut merged: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
             for arg in args {
-                if let TaggedValue::Obj(map) = arg {
+                if let Some(map) = view_fields(arg) {
                     for (k, v) in map.iter() {
                         merged.insert(Rc::clone(k), v.clone());
                     }
@@ -1308,8 +1328,8 @@ pub fn apply_native_op(
                     .unwrap_or_else(|| ctx.node_kind_at(entry_ref).as_deref() == Some("entry"));
                 if !is_entry {
                     let spread_val = ctx.eval_node(entry_ref)?;
-                    if let Some(spread_obj) = spread_val.as_object() {
-                        for (k, v) in spread_obj {
+                    if let Some(spread_obj) = view_fields(&spread_val) {
+                        for (k, v) in spread_obj.iter() {
                             obj.insert(Rc::clone(k), v.clone());
                         }
                     }
@@ -1759,17 +1779,17 @@ pub fn apply_native_op(
         // extended to objects. `tag_fields`/`obj_except` run only behind
         // those guards, so a non-object input errors.
         //
-        // `TaggedValue::Obj` is the wire-decode gate: `__pair__`/
-        // `__either__`/`__bytes__`/`__sym__`/`__arrow__`/`__resource__`/
-        // `__tensor__` marker records decode to non-Obj variants, so a
-        // `matches!(v, TaggedValue::Obj(_))` here is exactly
-        // `try_object_pattern`'s object test (the term-interpreter's
-        // `tagged_is_obj`).
+        // The object test is the tagged-object view
+        // ([`view_fields`], mirroring `try_object_pattern` and the
+        // term-interpreter's `tagged_is_obj`): `Obj` and the opaque
+        // variants (`__bytes__`/`__sym__`/`__resource__`/`__tensor__`
+        // decodings) present a record; `__pair__`/`__either__`/
+        // `__arrow__` decodings do not.
         "is_obj" => {
             let v = incoming
                 .or_else(|| args.first().cloned())
                 .unwrap_or(TaggedValue::Null);
-            Ok((TaggedValue::Bool(matches!(v, TaggedValue::Obj(_))), false))
+            Ok((TaggedValue::Bool(v.object_view().is_some()), false))
         }
         // `obj_key` — coerce a computed object-pattern key expression's
         // value to a field name: `v.as_str().unwrap_or("")`, mirroring
@@ -1798,7 +1818,7 @@ pub fn apply_native_op(
                 let v = incoming
                     .or_else(|| args.first().cloned())
                     .unwrap_or(TaggedValue::Null);
-                let hit = matches!(&v, TaggedValue::Obj(map) if map.contains_key(key));
+                let hit = view_fields(&v).is_some_and(|m| m.contains_key(key));
                 return Ok(Some((TaggedValue::Bool(hit), false)));
             }
             if args.len() < 2 {
@@ -1807,7 +1827,7 @@ pub fn apply_native_op(
                 ));
             }
             let key = args[1].as_str().unwrap_or("");
-            let hit = matches!(&args[0], TaggedValue::Obj(map) if map.contains_key(key));
+            let hit = view_fields(&args[0]).is_some_and(|m| m.contains_key(key));
             Ok((TaggedValue::Bool(hit), false))
         }
         // `tag_fields` — the tag-pattern binders' payload source
@@ -1869,7 +1889,7 @@ pub fn apply_native_op(
                         "obj_except: missing keys literal".to_string(),
                     ));
                 };
-            let TaggedValue::Obj(map) = &obj_val else {
+            let Some(map) = view_fields(&obj_val) else {
                 return Err(LangError::engine(
                     "obj_except: input is not an object".to_string(),
                 ));
@@ -2028,12 +2048,24 @@ pub fn apply_native_op(
                 Ok((opt_none(), false))
             } else if input.get("_tag").and_then(|t| t.as_str()) == Some("Some") {
                 let inner = input.get("value").cloned().unwrap_or(TaggedValue::Null);
-                let field_val = inner.get(field_name).cloned().unwrap_or(TaggedValue::Null);
+                let field_val = inner
+                    .get(field_name)
+                    .cloned()
+                    .or_else(|| {
+                        view_fields(&inner).and_then(|m| m.get(field_name).cloned())
+                    })
+                    .unwrap_or(TaggedValue::Null);
                 Ok((opt_some(field_val), false))
             } else if input.get("_tag").and_then(|t| t.as_str()) == Some("None") {
                 Ok((opt_none(), false))
             } else {
-                let field_val = input.get(field_name).cloned().unwrap_or(TaggedValue::Null);
+                let field_val = input
+                    .get(field_name)
+                    .cloned()
+                    .or_else(|| {
+                        view_fields(&input).and_then(|m| m.get(field_name).cloned())
+                    })
+                    .unwrap_or(TaggedValue::Null);
                 Ok((opt_some(field_val), false))
             }
         }
@@ -2105,6 +2137,19 @@ pub fn apply_native_op(
                     .cloned()
                     .map(|v| (v, false))
                     .ok_or_else(|| LangError::engine(format!("index: key '{}' not found", key))),
+                // The tagged-object view: an opaque variant (`Tensor`/
+                // `Bytes`/`Sym`/`Resource`) projects its `{"__x__": …}`
+                // wire record — `t.__tensor__` reads the same record a
+                // `.hnl`-authored wire value carries.
+                (target, TaggedValue::Str(key)) if view_fields(&target).is_some() => {
+                    let map = view_fields(&target).expect("guard");
+                    map.get(key.as_ref())
+                        .cloned()
+                        .map(|v| (v, false))
+                        .ok_or_else(|| {
+                            LangError::engine(format!("index: key '{}' not found", key))
+                        })
+                }
                 (target, index) => Err(LangError::engine(format!(
                     "index: target must be array/object and index must be number/string; got {} and {}",
                     type_tag(&target),
@@ -2203,6 +2248,15 @@ pub fn apply_native_op(
                 (TaggedValue::Str(s), TaggedValue::Str(key)) => {
                     let joined: Rc<str> = Rc::from(format!("{}.{}", s.as_ref(), key.as_ref()));
                     Ok((TaggedValue::Str(joined), false))
+                }
+                // The tagged-object view: an opaque variant (`Tensor`/
+                // `Bytes`/`Sym`/`Resource`) projects its `{"__x__": …}`
+                // wire record; a missing key yields `null`, matching
+                // the `Obj` arm.
+                (target, TaggedValue::Str(key)) if view_fields(&target).is_some() => {
+                    let map = view_fields(&target).expect("guard");
+                    let v = map.get(key.as_ref()).cloned().unwrap_or(TaggedValue::Null);
+                    Ok((v, false))
                 }
                 (target, field) => Err(LangError::engine(format!(
                     "field_access: target must be object/array, field must be string/number; got {} and {}",
