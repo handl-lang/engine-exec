@@ -2760,30 +2760,72 @@ fn is_return_node(ctx: &mut dyn NativeOpCtx, r: AstRef) -> bool {
 /// `subject`/`annot` role convention, ADR-0081) delegates to that child.
 /// This makes `f: T = v`-shaped statements bind `f` without any kind
 /// check.
+///
+/// Mirrors the checker's `binding_target_name` scope-pass resolution so
+/// the exec artifact binds the same names the checker scoped:
+///
+/// - `field` first — a field-access target (`type.Score := Nat`, or
+///   `obj.field := v`) binds the *field* name, resolved before the
+///   generic role loop: descending its `target` role would "bind" the
+///   namespace (`type`) instead.
+/// - `callee` — a `call` target (`type.Id(A) := A`, `f(x) := body`)
+///   binds the callee head's name.
+/// - `source` precedes `target` in the role loop — a `dim_arrow`
+///   (`X: (A,B) ~[N]~> R`) keeps the declared name under `source` while
+///   `target` is the return-type expression.
+/// - `params` precedes `body` — a `function` target
+///   (`narrow : T ~> U := f` parses as
+///   `assign(function(type-annot(narrow, T), U), f)`) keeps the
+///   annotated name under `params`, the result type under `body`.
+/// - `expr` last — `runtime-assert` wrappers (the ADR-0068 pass rewrites
+///   `type-annot` nodes in-place when blocked-predicate diagnostics
+///   exist, so an annotated name may sit under `expr`).
 fn binding_target_name(
     ctx: &mut dyn NativeOpCtx,
     target_idx: usize,
     err_ctx: &str,
 ) -> Result<String, LangError> {
-    let mut r = AstRef::new(target_idx);
-    let mut payload = ctx
-        .node_payload_at(r)
-        .ok_or(LangError::AstIndexOutOfBounds { index: target_idx })?;
-    // Unwrap `subject`-roled wrappers (annotation-like nodes).
-    for _ in 0..8 {
-        if let Some(name) = payload.as_str() {
-            return Ok(name.to_string());
+    fn resolve(ctx: &mut dyn NativeOpCtx, r: AstRef, depth: usize) -> Option<String> {
+        if depth == 0 {
+            return None;
         }
-        let subject_idx = match role_child_arena(ctx, r, "subject") {
-            Some(i) => i,
-            None => break,
-        };
-        r = AstRef::new(subject_idx);
-        payload = ctx
-            .node_payload_at(r)
-            .ok_or(LangError::AstIndexOutOfBounds { index: subject_idx })?;
+        let payload = ctx.node_payload_at(r)?;
+        if let Some(name) = payload.as_str() {
+            return Some(name.to_string());
+        }
+        let children = node_children(ctx, r)?;
+        // `field` — see fn docs; resolved before the role loop so the
+        // access's `target` role can't capture the namespace name.
+        if let Some(field_pos) = ctx.child_role_index_at(r, "field") {
+            if let Some(field) = payload.get("field").and_then(|v| v.as_str()) {
+                return Some(field.to_string());
+            }
+            if let Some(raw) = children.get(field_pos).and_then(|v| v.as_u64()) {
+                if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
+                    return Some(name);
+                }
+            }
+        }
+        // `callee` — a `call` target binds the callee head's name.
+        if let Some(callee_pos) = ctx.child_role_index_at(r, "callee") {
+            if let Some(raw) = children.get(callee_pos).and_then(|v| v.as_u64()) {
+                if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
+                    return Some(name);
+                }
+            }
+        }
+        for role in ["source", "target", "subject", "params", "body", "expr"] {
+            if let Some(pos) = ctx.child_role_index_at(r, role) {
+                if let Some(raw) = children.get(pos).and_then(|v| v.as_u64()) {
+                    if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        None
     }
-    payload.as_str().map(str::to_string).ok_or_else(|| {
+    resolve(ctx, AstRef::new(target_idx), 8).ok_or_else(|| {
         LangError::engine(format!("{err_ctx}: binding target must be an identifier"))
     })
 }
