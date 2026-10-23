@@ -25,6 +25,7 @@
 use handl_language::{Ast, AstNode, AstRef, LangError, Language};
 use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
+use serde_json::Value;
 use std::rc::Rc;
 
 /// Engine-specific context for pattern matching (ADR-0061).
@@ -66,6 +67,34 @@ pub trait PatternMatchCtx {
     /// scope still binds (binders shadow). The default returns `None`:
     /// engines without ambient globals keep bind-everything semantics.
     fn global_value(&self, _name: &str) -> Option<TaggedValue> {
+        None
+    }
+
+    /// Resolve a name through the visible scope stack (innermost-out) —
+    /// *not* just the ambient globals [`global_value`](Self::global_value)
+    /// covers.
+    ///
+    /// Two pattern forms read it:
+    ///
+    /// - **0-arg constructor patterns.** A `var` pattern naming a
+    ///   canonical constructor *value* (`{"__ctor__": sym, …}` — ADR-0152)
+    ///   is a value pattern: it matches by `==` like a global. This is
+    ///   what lets `match v { VNil: a, VCons(x, xs): b }` dispatch on the
+    ///   0-argument arm — `VNil` is a scope-bound ctor object, not a
+    ///   binder. A name resolving to a non-ctor value still binds
+    ///   (binder shadowing is unchanged).
+    /// - **Constructor field order.** The callee of a `Ctor(…)` call
+    ///   pattern resolves to the constructor arrow; its `params` are the
+    ///   declared argument order, which is the authoritative positional
+    ///   order for binding pattern binders to object fields (a
+    ///   `TaggedValue::Obj` is unordered — alphabetical order is only a
+    ///   fallback).
+    ///
+    /// The default returns `None`: engines without scope access (e.g.
+    /// the standalone cranelift driver) keep binder/equality semantics
+    /// driven by `global_value` alone and bind ctor fields in the
+    /// sorted-field fallback order.
+    fn scope_value(&self, _name: &str) -> Option<TaggedValue> {
         None
     }
 
@@ -156,6 +185,19 @@ pub fn try_pattern(
             // than binding.
             if let Some(global) = ctx.global_value(name) {
                 return Ok(handl_value::eq(&global, scrut));
+            }
+            // Constructor value pattern (ADR-0152): a `var` naming a
+            // scope-bound canonical ctor object (`{"__ctor__": sym, …}`)
+            // is the 0-argument constructor pattern — `VNil:` in
+            // `match v { VNil: a, VCons(x, xs): b }`. It matches by
+            // equality (the seeded `__ctor__` syms compare by handle), so
+            // the arm only fires on that constructor's values. A name
+            // resolving to a non-ctor value is not a value pattern — it
+            // falls through and binds, preserving shadowing.
+            if let Some(scoped) = ctx.scope_value(name) {
+                if is_ctor_object(&scoped) {
+                    return Ok(handl_value::eq(&scoped, scrut));
+                }
             }
             // Binder — always matches, binds name → scrutinee.
             ctx.define_binding(name, scrut.clone());
@@ -474,7 +516,18 @@ fn try_tag_pattern(
     let scrut_tag = scrut_obj.get("__tag__").and_then(|v| v.as_str());
     match scrut_tag {
         Some(t) if t == tag_name => {}
-        _ => return Ok(false),
+        // Canonical constructor object (ADR-0152 §2): `{"__ctor__": sym,
+        // <arg fields…>, "type": {__former__, indices}}` minted by the
+        // `data` desugar. Dispatch is constructor *identity* — the
+        // seeded sym's display name is the ctor's source name (the
+        // seed's last `.`-segment), mirroring `fold_chain`'s
+        // `eq(v.__ctor__, cSym)` check in the recursor path. A `__ctor__`
+        // sym with a different name is a miss, not a tag miss; a
+        // scrutinee with neither `__tag__` nor a `__ctor__` sym cannot
+        // match a tag/ctor pattern at all.
+        _ => {
+            return try_ctor_object_pattern(ast, pattern_node, children, tag_name, scrut_obj, ctx);
+        }
     }
     // Collect payload fields (excluding __tag__), sorted alphabetically
     // for deterministic positional binding.
@@ -520,6 +573,95 @@ fn try_tag_pattern(
                 }
                 if let Some(&(_, val)) = payload_fields.get(i) {
                     ctx.define_binding(name, val.clone());
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `v` is a canonical constructor object — a `{"__ctor__": sym,
+/// …}` object carrying the nominal identity the `data` desugar mints
+/// (ADR-0152 §2). Only the `__ctor__` *sym* counts: a plain object that
+/// happens to carry a `__ctor__` key of another shape is not a ctor
+/// value.
+fn is_ctor_object(v: &TaggedValue) -> bool {
+    matches!(v, TaggedValue::Obj(o) if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))))
+}
+
+/// Constructor-object pattern (`Ctor(binder, …)` against a
+/// `{"__ctor__": sym, <fields…>, "type": …}` scrutinee — ADR-0152 §2).
+///
+/// Called from [`try_tag_pattern`] when the scrutinee has no matching
+/// `__tag__`: an object whose `__ctor__` is a [`Sym`] whose display name
+/// equals the callee name matches (the seeded ctor sym's name is the
+/// constructor's source name — `Sym::seeded` takes the seed's last
+/// `.`-segment, so `data.Vec.VCons` mints `VCons`). Any other `__ctor__`
+/// value, a name mismatch, or a missing `__ctor__` is a miss.
+///
+/// Binders bind positionally to the constructor's declared argument
+/// fields. Declared order comes from the constructor arrow itself — the
+/// callee name resolved through [`PatternMatchCtx::scope_value`] yields
+/// the `VCons = (x, xs) ~> {…}` arrow whose `params` are the declaration
+/// order (a `TaggedValue::Obj` is unordered). When the callee does not
+/// resolve to an arrow the binders fall back to the tag-pattern
+/// convention — alphabetical field order, excluding the nominal
+/// `__ctor__`/`type` members.
+fn try_ctor_object_pattern(
+    ast: &Ast,
+    pattern_node: &AstNode,
+    children: &[Value],
+    tag_name: &str,
+    scrut_obj: &FxHashMap<Rc<str>, TaggedValue>,
+    ctx: &mut impl PatternMatchCtx,
+) -> Result<bool, LangError> {
+    let ctor_name = match scrut_obj.get("__ctor__") {
+        Some(TaggedValue::Sym(s)) => s.name().to_string(),
+        _ => return Ok(false),
+    };
+    if ctor_name != tag_name {
+        return Ok(false);
+    }
+    // Collect binder nodes (the `args` role onward; index 1 on canonical
+    // `call`) — same layout `try_tag_pattern` uses.
+    let binder_indices: Vec<usize> = children
+        .iter()
+        .skip(child_idx(ctx.lang(), pattern_node, "args", 1))
+        .map(|c| -> Result<usize, LangError> {
+            let idx = c.as_u64().ok_or_else(|| {
+                LangError::engine_node("tag pattern: bad binder index".to_string(), pattern_node)
+            })?;
+            Ok(idx as usize)
+        })
+        .collect::<Result<_, _>>()?;
+    // Declared argument order from the constructor arrow's `params`;
+    // sorted-field fallback (minus the nominal members) when the callee
+    // does not resolve to an arrow.
+    let declared: Option<Vec<String>> = match ctx.scope_value(tag_name) {
+        Some(TaggedValue::Arrow { params, .. }) => Some(params.iter().cloned().collect()),
+        _ => None,
+    };
+    let mut sorted_fields: Vec<(&Rc<str>, &TaggedValue)> = Vec::new();
+    if declared.is_none() {
+        sorted_fields = scrut_obj
+            .iter()
+            .filter(|(k, _)| k.as_ref() != "__ctor__" && k.as_ref() != "type")
+            .collect();
+        sorted_fields.sort_by(|a, b| a.0.cmp(b.0));
+    }
+    for (i, &binder_idx) in binder_indices.iter().enumerate() {
+        let binder_node = ast.at(AstRef::new(binder_idx))?;
+        if is_binder_node(ctx.lang(), binder_node) {
+            if let Some(name) = binder_node.payload.as_str() {
+                if is_wildcard_name(name) {
+                    continue; // Wildcard
+                }
+                let val = match &declared {
+                    Some(fields) => fields.get(i).and_then(|f| scrut_obj.get(f.as_str())),
+                    None => sorted_fields.get(i).map(|(_, v)| *v),
+                };
+                if let Some(v) = val {
+                    ctx.define_binding(name, v.clone());
                 }
             }
         }
