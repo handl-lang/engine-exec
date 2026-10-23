@@ -30,7 +30,7 @@ use std::rc::Rc;
 use crate::ImportResolver;
 use handl_language::{AstRef, LangError, Value};
 use handl_value::{
-    TaggedValue, cell_comp_axis, cell_compose, cell2_comp_v, cell2_id, cell2_src, cell2_tgt,
+    Sym, TaggedValue, cell_comp_axis, cell_compose, cell2_comp_v, cell2_id, cell2_src, cell2_tgt,
     cell2_whisker, either_left, either_right, is_either_left, is_either_right, pair, pair_fst,
     pair_snd, record_proj,
 };
@@ -291,6 +291,13 @@ pub enum OpService {
     /// engine that supports the service but has no resolver configured
     /// reports the canonical "no import resolver configured" error.
     Import,
+    /// The runtime handler stack — the `handle_dyn` op installs a
+    /// handler for the dynamic extent of its body and interprets
+    /// `IO(sig)` former results through it (ADR-0076, ADR-0153 §4).
+    /// Engines that provide [`NativeOpCtx::handler_push`] /
+    /// [`NativeOpCtx::handler_pop`] / [`NativeOpCtx::handler_lookup`]
+    /// report this service.
+    HandlerStack,
 }
 
 /// Engine-specific globals the shared ops need.
@@ -503,6 +510,23 @@ pub trait NativeOpCtx {
     fn import_resolver(&self) -> Option<&dyn ImportResolver> {
         None
     }
+
+    /// Push a handler value onto the runtime handler stack for the
+    /// dynamic extent of the enclosing `handle` (ADR-0076).
+    fn handler_push(&mut self, handler: TaggedValue);
+
+    /// Pop the most recently pushed handler. Implementations must
+    /// tolerate underflow silently — balanced push/pop discipline lives
+    /// in the `handle_dyn` op, but a popped-on-error path may see an
+    /// already-short stack.
+    fn handler_pop(&mut self);
+
+    /// Resolve `op` against the handler stack, innermost-first — the
+    /// `dispatch_op` lookup half of `handle <body> with <handler>`
+    /// dynamic extent (tree-walk `dispatch_op`'s stack search). `None`
+    /// means no pushed handler implements `op` — the op stays unhandled
+    /// data for outer handlers.
+    fn handler_lookup(&self, op: &str) -> Option<TaggedValue>;
 }
 
 // ===========================================================================
@@ -994,6 +1018,24 @@ pub fn apply_native_op(
                 return Ok(None);
             }
             match_shell(op, ctx)
+        }
+        // `handle_dyn` — dynamic-extent handler installation: the runtime
+        // semantics of the `eval.handle` `Term::Handle` scheme for an
+        // *unnamed* target (`handle <body> with <handler>`). The compiled
+        // backends emit this op instead of `Term::eliminate_handlers`
+        // when `target` is empty — capability substitution cannot see a
+        // dynamic-extent handler (the body's ops aren't a named
+        // capability). The tree-walk's `Handle` arm runs the same
+        // semantics inline (handler-stack push → body eval →
+        // `IO(sig)`-former interpretation → carried-handler attach).
+        "handle_dyn" => {
+            if !ctx.supports(OpService::EvalNode)
+                || !ctx.supports(OpService::ApplyArrow)
+                || !ctx.supports(OpService::HandlerStack)
+            {
+                return Ok(None);
+            }
+            handle_dyn_shell(ctx)
         }
         // --- constructor ops ---------------------------------------------
         // `closure` — mint a `TaggedValue::Arrow` (the bound-arrow
@@ -3206,6 +3248,199 @@ fn match_shell(op: &str, ctx: &mut dyn NativeOpCtx) -> OpResult {
         // No clause matched — the handled value passes through as-is.
         Ok((scrut_val, false))
     }
+}
+
+// ===========================================================================
+// Dynamic-extent handlers (`handle_dyn`) — unified
+// ===========================================================================
+
+/// The tag marking a first-class `arr <op>` dispatch object
+/// (`{__arr__: {op, handlers?}}`, ADR-0103 value shape — mirrors the
+/// tree-walk's `ARR_DISPATCH_TAG`).
+const ARR_DISPATCH_TAG: &str = "__arr__";
+
+/// Extract the implementation entry for `op` from a handler-like value
+/// (the single spelling of the tree-walk's `handler_impl`, previously
+/// copy-pasted in each compiled backend).
+///
+/// A canonical `handler` value is a tagged object
+/// `{"__tag__": "handler", "impls": {"<op>": <arrow or Term>, ...}}`.
+/// Surface handler records are plain objects whose keys are the operation
+/// names: `{"<op>": <arrow or Term>, ...}`. Returns the value for `op`,
+/// or `None` when the value has no implementation for `op`.
+pub fn handler_impl(v: &TaggedValue, op: &str) -> Option<TaggedValue> {
+    v.get("impls")
+        .and_then(|impls| impls.get(op))
+        .or_else(|| v.get(op))
+        .cloned()
+}
+
+/// Deep-handler attachment (ADR-0076): record `handler` on an applicable
+/// value produced under `handle … with handler`, so each later
+/// application reinstalls it for the body's extent (the tree-walk
+/// `attach_carried_handler`, moved here so `handle_dyn` is
+/// backend-agnostic).
+///
+/// - `arr <op>` dispatch objects (`{__arr__: {op}}`) carry
+///   `__arr__.handlers`.
+/// - Closures (`TaggedValue::Arrow`) carry `handlers` in the arrow
+///   record itself — no `__handlers__` env smuggling.
+/// - Anything else passes through unchanged — a non-applicable `handle`
+///   result keeps pure dynamic-extent semantics.
+pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> TaggedValue {
+    match val {
+        TaggedValue::Obj(map) if map.get(ARR_DISPATCH_TAG).is_some() => {
+            let mut map = (*map).clone();
+            let mut inner: FxHashMap<Rc<str>, TaggedValue> = map
+                .get(ARR_DISPATCH_TAG)
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            let mut handlers: Vec<TaggedValue> = match inner.get("handlers") {
+                Some(TaggedValue::Arr(hs)) => hs.iter().cloned().collect(),
+                _ => Vec::new(),
+            };
+            handlers.push(handler.clone());
+            inner.insert(Rc::from("handlers"), TaggedValue::Arr(Rc::from(handlers)));
+            map.insert(Rc::from(ARR_DISPATCH_TAG), TaggedValue::Obj(Rc::new(inner)));
+            TaggedValue::Obj(Rc::new(map))
+        }
+        TaggedValue::Arrow {
+            params,
+            rest,
+            array_pattern,
+            body_def,
+            binds,
+            handlers,
+        } => {
+            let mut hs = handlers.to_vec();
+            hs.push(handler.clone());
+            TaggedValue::Arrow {
+                params,
+                rest,
+                array_pattern,
+                body_def,
+                binds,
+                handlers: Rc::from(hs),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Apply a resolved handler implementation to the sig operand — mirror
+/// of the tree-walk `dispatch_op` apply half: arrow values apply
+/// directly; anything else is treated as a serialized `Term` and applied
+/// through the `{"__term__", "__bound__": []}` bound-arrow convention
+/// (every `OpService::ApplyArrow` implementation reads it).
+fn apply_handler_impl(
+    ctx: &mut dyn NativeOpCtx,
+    impl_val: &TaggedValue,
+    operand: &TaggedValue,
+) -> Result<TaggedValue, LangError> {
+    if matches!(impl_val, TaggedValue::Arrow { .. }) {
+        return ctx.apply_arrow(impl_val, std::slice::from_ref(operand));
+    }
+    let mut bound: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
+    bound.insert(Rc::from("__term__"), impl_val.clone());
+    bound.insert(Rc::from("__bound__"), TaggedValue::Arr(Rc::from(vec![])));
+    ctx.apply_arrow(
+        &TaggedValue::Obj(Rc::new(bound)),
+        std::slice::from_ref(operand),
+    )
+}
+
+/// `IO(sig)` effect interpretation (ADR-0153 §4) — the shared port of
+/// the tree-walk `Handle` arm's `interpret_io_former`: an `IO` former
+/// object `{"__former__": <type.io sym>, "indices": [sig]}` produced
+/// under `handle … with` has its sig record's fields read as op names
+/// and dispatched to the covering handler's matching entry
+/// ([`NativeOpCtx::handler_lookup`]), with the sig entry's value as the
+/// operand, and the entry is replaced by the handler's result. Ops no
+/// handler covers keep their original value — the `IO` object stays
+/// data for outer handlers or user destructuring. A non-IO value (or an
+/// `IO` with no object sig) passes through untouched.
+fn interpret_io_former(
+    ctx: &mut dyn NativeOpCtx,
+    val: TaggedValue,
+) -> Result<TaggedValue, LangError> {
+    let TaggedValue::Obj(map) = &val else {
+        return Ok(val);
+    };
+    let io_handle = Sym::seeded("type.io").handle();
+    let is_io = match map.get("__former__") {
+        Some(TaggedValue::Sym(s)) => s.handle() == io_handle,
+        Some(TaggedValue::Obj(f)) => {
+            matches!(f.get("sym"), Some(TaggedValue::Sym(s)) if s.handle() == io_handle)
+        }
+        _ => false,
+    };
+    if !is_io {
+        return Ok(val);
+    }
+    let mut indices: Vec<TaggedValue> = match map.get("indices") {
+        Some(TaggedValue::Arr(xs)) => xs.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
+    let Some(TaggedValue::Obj(sig_map)) = indices.first() else {
+        return Ok(val);
+    };
+    let mut out_sig: FxHashMap<Rc<str>, TaggedValue> = (**sig_map).clone();
+    for (k, req) in out_sig.clone() {
+        if let Some(impl_val) = ctx.handler_lookup(k.as_ref()) {
+            let res = apply_handler_impl(ctx, &impl_val, &req)?;
+            out_sig.insert(k, res);
+        }
+    }
+    indices[0] = TaggedValue::Obj(Rc::new(out_sig));
+    let mut out_map = (**map).clone();
+    out_map.insert(Rc::from("indices"), TaggedValue::Arr(Rc::from(indices)));
+    Ok(TaggedValue::Obj(Rc::new(out_map)))
+}
+
+/// The shared `handle <body> with <handler>` dynamic-extent shell
+/// (ADR-0076 + ADR-0153 §4), mirroring the tree-walk `Handle` arm:
+///
+/// 1. evaluate the `impl` child into a handler value;
+/// 2. push it onto the runtime handler stack;
+/// 3. evaluate the `target` (body) child under it;
+/// 4. interpret an `IO(sig)` former result through [`interpret_io_former`]
+///    (the handler is still on the stack, so [`NativeOpCtx::handler_lookup`]
+///    resolves covered ops exactly like an `arr <op>` dispatch);
+/// 5. pop the handler — on *every* exit, hit or error;
+/// 6. attach the carried handler for deep dispatch
+///    ([`attach_carried_handler`]) and return the value.
+///
+/// `target`/`impl` positions resolve by named role (ADR-0081) with the
+/// positional 0/1 fallback for role-less shapes — the same convention
+/// [`match_shell`] applies.
+fn handle_dyn_shell(ctx: &mut dyn NativeOpCtx) -> OpResult {
+    let children = ctx
+        .node_payload()
+        .and_then(|p| p.get("children"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .ok_or_else(|| LangError::engine("handle_dyn: missing children in payload".to_string()))?;
+    let child_at = |ctx: &mut dyn NativeOpCtx,
+                    role: &str,
+                    fallback: usize|
+     -> Result<usize, LangError> {
+        ctx.child_role_index_for(role)
+            .and_then(|pos| children.get(pos).and_then(Value::as_u64))
+            .or_else(|| children.get(fallback).and_then(Value::as_u64))
+            .map(|i| i as usize)
+            .ok_or_else(|| LangError::engine(format!("handle_dyn: missing {role} child")))
+    };
+    let target_idx = child_at(ctx, "target", 0)?;
+    let impl_idx = child_at(ctx, "impl", 1)?;
+    let handler = ctx.eval_node(AstRef::new(impl_idx))?;
+    ctx.handler_push(handler.clone());
+    let result = match ctx.eval_node(AstRef::new(target_idx)) {
+        Ok(v) => interpret_io_former(ctx, v),
+        Err(e) => Err(e),
+    };
+    ctx.handler_pop();
+    let val = result?;
+    Ok((attach_carried_handler(val, &handler), false))
 }
 
 // ===========================================================================

@@ -12,7 +12,9 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 name = "handl-language"
 version = "0.1.0"
 dependencies = [
+ "handl-value",
  "hnl-engine",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",
@@ -22,6 +24,7 @@ dependencies = [
 name = "handl-platform"
 version = "0.1.0"
 dependencies = [
+ "handl-value",
  "semver",
  "serde",
  "serde_json",
