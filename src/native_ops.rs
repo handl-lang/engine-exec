@@ -2732,8 +2732,70 @@ pub fn apply_native_op(
         }
         "transport" => Ok((args.get(1).cloned().unwrap_or(TaggedValue::Null), false)),
         "export" => {
-            // Export marking is a no-op for now.
-            Ok((args.first().cloned().unwrap_or(TaggedValue::Null), false))
+            // `export <decl>` binds the declared name in the running
+            // env so later statements and the block tail see it
+            // (`hnl run` semantics): `export x := v` parses as
+            // `export(assign(x, v))`; `export x` re-exports the current
+            // binding; a signature export binds the subject's evaluated
+            // form. The child's value is already `args[0]` — only the
+            // name resolution needs the arena. A child with no
+            // resolvable name (literal-ish export) passes through
+            // without binding; engines without Env keep the no-op.
+            let value = args.first().cloned().unwrap_or(TaggedValue::Null);
+            if ctx.supports(OpService::Env) {
+                let child_idx = ctx
+                    .node_payload()
+                    .and_then(|p| p.get("children"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .and_then(|v| v.as_u64())
+                    .map(|i| i as usize);
+                if let Some(child_idx) = child_idx {
+                    let child = AstRef::new(child_idx);
+                    // Binding child (`export x := v`/`x = v in body`):
+                    // descend to its `target` role; anything else
+                    // (`var`, signature) is itself the named node.
+                    let target_idx = if is_assign_node(ctx, child) {
+                        role_child_arena(ctx, child, "target")
+                            .or_else(|| {
+                                node_children(ctx, child)
+                                    .and_then(|c| c.first().and_then(|v| v.as_u64()))
+                                    .map(|i| i as usize)
+                            })
+                            .unwrap_or(child_idx)
+                    } else {
+                        child_idx
+                    };
+                    if let Ok(name) = binding_target_name(ctx, target_idx, "export") {
+                        // Mirror `eval_block`'s self-ref marker for
+                        // `export f := …f…` so recursive exports mint
+                        // the same `binds` entry.
+                        let bound = if is_assign_node(ctx, child) {
+                            let value_idx = role_child_arena(ctx, child, "value").or_else(|| {
+                                node_children(ctx, child)
+                                    .and_then(|c| c.get(1).and_then(|v| v.as_u64()))
+                                    .map(|i| i as usize)
+                            });
+                            match value_idx {
+                                Some(vi)
+                                    if handl_language::subtree_name_candidates(
+                                        |r| ctx.node_payload_at(r),
+                                        AstRef::new(vi),
+                                    )
+                                    .is_some_and(|n| n.contains(name.as_str())) =>
+                                {
+                                    handl_value::with_self_ref_bind(&value, &name)
+                                }
+                                _ => value.clone(),
+                            }
+                        } else {
+                            value.clone()
+                        };
+                        ctx.env_assign(&name, bound);
+                    }
+                }
+            }
+            Ok((value, false))
         }
         "record_proj" => {
             let record = args.first().cloned().unwrap_or(TaggedValue::Null);
