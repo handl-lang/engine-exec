@@ -27,6 +27,7 @@
 
 use std::rc::Rc;
 
+use crate::pattern_match::is_ctor_object;
 use crate::ImportResolver;
 use handl_language::{AstRef, LangError, Value};
 use handl_value::{
@@ -133,7 +134,65 @@ pub fn as_num(v: &TaggedValue) -> Result<Num, LangError> {
     match v {
         TaggedValue::Int(i) => Ok(Num::Int(*i)),
         TaggedValue::Float(f) => Ok(Num::Float(*f)),
+        TaggedValue::Obj(_) => nat_ctor_depth(v)
+            .map(Num::Int)
+            .ok_or_else(|| LangError::engine(format!("expected number, got {:?}", v))),
         _ => Err(LangError::engine(format!("expected number, got {:?}", v))),
+    }
+}
+
+/// The `Nat`-tower numeral a constructor object encodes (ADR-0152 §2):
+/// `Succ(pred)` counts `1 + pred`, `Zero` counts `0`. The shape is
+/// data-driven — every non-`__ctor__`/`type` field must be a
+/// constructor object of the *same* former (`type.__former__` syms
+/// equal), and there is at most one such link — so `Zero`/`VNil` is
+/// `0`, `Succ(Zero)` is `1`, and a value carrying any non-link field
+/// (`Jx(9)`, `VCons(k, x, xs)`) or two links is *not* a numeral and
+/// errors through `as_num` as before.
+fn nat_ctor_depth(v: &TaggedValue) -> Option<i64> {
+    let obj = match v {
+        TaggedValue::Obj(o)
+            if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) =>
+        {
+            o
+        }
+        _ => return None,
+    };
+    let former = match obj.get("type") {
+        Some(TaggedValue::Obj(t)) => t.get("__former__").cloned(),
+        _ => None,
+    };
+    let former = former?;
+    let same_former_link = |val: &TaggedValue| match val {
+        TaggedValue::Obj(o)
+            if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) =>
+        {
+            match o.get("type") {
+                Some(TaggedValue::Obj(t)) => {
+                    matches!(t.get("__former__"), Some(f) if handl_value::eq(f, &former))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    let mut link: Option<&TaggedValue> = None;
+    for (k, val) in obj.iter() {
+        if k.as_ref() == "__ctor__" || k.as_ref() == "type" {
+            continue;
+        }
+        if same_former_link(val) {
+            if link.is_some() {
+                return None; // two same-former links — not a tower
+            }
+            link = Some(val);
+        } else {
+            return None; // a non-link field — not a numeral tower
+        }
+    }
+    match link {
+        Some(next) => nat_ctor_depth(next).and_then(|d| d.checked_add(1)),
+        None => Some(0),
     }
 }
 
@@ -1152,7 +1211,21 @@ pub fn apply_native_op(
                 std::collections::HashMap::with_capacity(captured.len());
             let mut binds: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
             for (name, value) in captured.iter() {
-                if rec_names.contains(name) || !arrow_free(value) {
+                // Canonical ctor objects stay residual `binds` too
+                // (ADR-0152 §2): `instantiate` substitutes only
+                // *term-position* `var`s — a `var` leaf in a match
+                // pattern is a binder site and is never rewritten, so a
+                // `subst`-baked `VNil` would leave the pattern's `var`
+                // unbound inside the arrow — `try_pattern`'s
+                // `scope_value` miss then degrades it to a catch-all
+                // binder and the first arm swallows every scrutinee.
+                // Keeping the ctor object in `binds` preserves the
+                // value-pattern's name reference (and term positions
+                // resolve it through `lookup` just as well).
+                if rec_names.contains(name)
+                    || !arrow_free(value)
+                    || is_ctor_object(value)
+                {
                     binds.insert(Rc::clone(name), value.clone());
                 } else {
                     subst.insert(Rc::clone(name), handl_value::tagged_to_value(value));

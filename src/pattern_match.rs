@@ -585,7 +585,7 @@ fn try_tag_pattern(
 /// (ADR-0152 §2). Only the `__ctor__` *sym* counts: a plain object that
 /// happens to carry a `__ctor__` key of another shape is not a ctor
 /// value.
-fn is_ctor_object(v: &TaggedValue) -> bool {
+pub(crate) fn is_ctor_object(v: &TaggedValue) -> bool {
     matches!(v, TaggedValue::Obj(o) if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))))
 }
 
