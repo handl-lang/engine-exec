@@ -1970,6 +1970,58 @@ pub fn apply_native_op(
                 )),
             }
         }
+        // `ctor_name` — the constructor-object discriminant (ADR-0152
+        // §2, `try_ctor_object_pattern`): an input object whose
+        // `__ctor__` is a sym yields the sym's *name*; every other
+        // input yields `null`, so the lowered
+        // `eq(ctor_name(v), "C")` check is *total* — a non-ctor
+        // scrutinee falls through to the next arm instead of erroring
+        // on a field projection. Mirrors the term-interpreter's
+        // `ctor_name` op.
+        "ctor_name" => {
+            let v = incoming
+                .or_else(|| args.first().cloned())
+                .unwrap_or(TaggedValue::Null);
+            let name = match &v {
+                TaggedValue::Obj(map) => match map.get("__ctor__") {
+                    Some(TaggedValue::Sym(s)) => {
+                        TaggedValue::Str(Rc::from(s.name()))
+                    }
+                    _ => TaggedValue::Null,
+                },
+                _ => TaggedValue::Null,
+            };
+            Ok((name, false))
+        }
+        // `ctor_fields` — the ctor-object pattern's sorted-field
+        // fallback for positional binding
+        // (`try_ctor_object_pattern`'s `sorted_fields`): the input
+        // object's non-`__ctor__`/`type` values, sorted by key. Only
+        // consulted behind the `ctor_name` check, so a non-object
+        // input errors like `tag_fields`. Mirrors the
+        // term-interpreter's `ctor_fields` op.
+        "ctor_fields" => {
+            let v = incoming
+                .or_else(|| args.first().cloned())
+                .unwrap_or(TaggedValue::Null);
+            match &v {
+                TaggedValue::Obj(map) => {
+                    let mut fields: Vec<(&Rc<str>, &TaggedValue)> = map
+                        .iter()
+                        .filter(|(k, _)| {
+                            k.as_ref() != "__ctor__" && k.as_ref() != "type"
+                        })
+                        .collect();
+                    fields.sort_by(|a, b| a.0.cmp(b.0));
+                    let vals: Vec<TaggedValue> =
+                        fields.into_iter().map(|(_, v)| v.clone()).collect();
+                    Ok((TaggedValue::Arr(Rc::from(vals)), false))
+                }
+                _ => Err(LangError::engine(
+                    "ctor_fields: input is not an object".to_string(),
+                )),
+            }
+        }
         // `obj_except[:keys]` — the object-pattern `...rest` binder's
         // payload: the object minus the listed (matched) keys.
         // Evaluated lazily from an arm body, so a non-object input
