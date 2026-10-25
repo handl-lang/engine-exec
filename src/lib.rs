@@ -17,6 +17,7 @@
 
 #![warn(missing_docs)]
 
+pub mod io;
 pub mod native_ops;
 pub mod pattern_match;
 
