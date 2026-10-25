@@ -150,6 +150,16 @@ pub fn as_num(v: &TaggedValue) -> Result<Num, LangError> {
 /// (`Jx(9)`, `VCons(k, x, xs)`) or two links is *not* a numeral and
 /// errors through `as_num` as before.
 fn nat_ctor_depth(v: &TaggedValue) -> Option<i64> {
+    // Growable-stack seam (`crate::STACK_RED_ZONE`): `Succ(Succ(…))`
+    // numeral towers recurse once per ctor layer.
+    stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
+        nat_ctor_depth_inner(v)
+    })
+}
+
+/// The recursive body of [`nat_ctor_depth`], run under
+/// [`stacker::maybe_grow`].
+fn nat_ctor_depth_inner(v: &TaggedValue) -> Option<i64> {
     let obj = match v {
         TaggedValue::Obj(o)
             if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) =>
@@ -574,11 +584,13 @@ pub trait NativeOpCtx {
     /// dynamic extent of the enclosing `handle` (ADR-0076).
     fn handler_push(&mut self, handler: TaggedValue);
 
-    /// Pop the most recently pushed handler. Implementations must
-    /// tolerate underflow silently — balanced push/pop discipline lives
-    /// in the `handle_dyn` op, but a popped-on-error path may see an
-    /// already-short stack.
-    fn handler_pop(&mut self);
+    /// Pop the most recently pushed handler, returning the popped frame
+    /// so the caller can read frame state installed during the extent
+    /// (e.g. the ADR-0158 `acc` slot's final value). Implementations
+    /// must tolerate underflow silently — balanced push/pop discipline
+    /// lives in the `handle_dyn` op, but a popped-on-error path may see
+    /// an already-short stack.
+    fn handler_pop(&mut self) -> Option<TaggedValue>;
 
     /// Resolve `op` against the handler stack, innermost-first — the
     /// `dispatch_op` lookup half of `handle <body> with <handler>`
@@ -586,6 +598,42 @@ pub trait NativeOpCtx {
     /// means no pushed handler implements `op` — the op stays unhandled
     /// data for outer handlers.
     fn handler_lookup(&self, op: &str) -> Option<TaggedValue>;
+
+    /// The accumulator slot of the innermost handler frame covering
+    /// `op` (ADR-0158 `handle … with h acc s0`): `Some(s)` when the
+    /// covering frame carries a [`HANDLER_ACC_KEY`] slot, `None` when
+    /// no frame covers `op` or the covering frame is accumulator-less.
+    /// Default: no accumulator support.
+    fn handler_acc(&self, op: &str) -> Option<TaggedValue> {
+        let _ = op;
+        None
+    }
+
+    /// Write `s'` into the accumulator slot of the innermost frame
+    /// covering `op` — the `c` wire write of the `acc` loop (ADR-0158).
+    /// No-op when no covering frame carries a slot. Default: no
+    /// accumulator support.
+    fn handler_set_acc(&mut self, op: &str, s: TaggedValue) {
+        let _ = (op, s);
+    }
+
+    /// Run the `handle_dyn` body's delimited dynamic extent — the
+    /// engine hook behind `handle <body> with <handler>` (ADR-0158 +
+    /// the multi-shot `resume` workstream).
+    ///
+    /// The shell has already pushed `frame_handler` (the acc-seeded
+    /// `handler`); this method **owns the pop**: it must pop exactly
+    /// the frame the shell pushed, on every exit path including
+    /// errors. One-shot engines delegate to
+    /// [`run_delimited_default`]; engines implementing multi-shot
+    /// `resume` override to run the body under a replay journal and
+    /// drive `h[op](payload, resume)` clauses on suspension.
+    fn run_delimited(
+        &mut self,
+        target: AstRef,
+        handler: &TaggedValue,
+        frame_handler: &TaggedValue,
+    ) -> Result<TaggedValue, LangError>;
 }
 
 // ===========================================================================
@@ -3514,26 +3562,228 @@ pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> Tagged
     }
 }
 
-/// Apply a resolved handler implementation to the sig operand — mirror
-/// of the tree-walk `dispatch_op` apply half: arrow values apply
+/// Apply a resolved handler implementation to the op's operands —
+/// mirror of the tree-walk `dispatch_op` apply half: arrow values apply
 /// directly; anything else is treated as a serialized `Term` and applied
 /// through the `{"__term__", "__bound__": []}` bound-arrow convention
-/// (every `OpService::ApplyArrow` implementation reads it).
-fn apply_handler_impl(
-    ctx: &mut dyn NativeOpCtx,
+/// (every `OpService::ApplyArrow` implementation reads it). `args` is
+/// `[payload]` for a plain op impl, `[payload, s]` for an `acc` impl
+/// (ADR-0158 — serialized-Term impls see the argument array as their
+/// single incoming under that convention).
+pub fn apply_handler_impl<C: NativeOpCtx + ?Sized>(
+    ctx: &mut C,
     impl_val: &TaggedValue,
-    operand: &TaggedValue,
+    args: &[TaggedValue],
 ) -> Result<TaggedValue, LangError> {
     if matches!(impl_val, TaggedValue::Arrow { .. }) {
-        return ctx.apply_arrow(impl_val, std::slice::from_ref(operand));
+        return ctx.apply_arrow(impl_val, args);
     }
     let mut bound: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
     bound.insert(Rc::from("__term__"), impl_val.clone());
     bound.insert(Rc::from("__bound__"), TaggedValue::Arr(Rc::from(vec![])));
-    ctx.apply_arrow(
-        &TaggedValue::Obj(Rc::new(bound)),
-        std::slice::from_ref(operand),
-    )
+    ctx.apply_arrow(&TaggedValue::Obj(Rc::new(bound)), args)
+}
+
+// ===========================================================================
+// ADR-0158 — resumable `perform`, `acc` state, `return` clause
+// ===========================================================================
+
+/// The accumulator slot key carried on a handler frame value installed
+/// by `handle <body> with h acc s0` (ADR-0158 — the `acc` clause's `c`
+/// wire as a frame field: `(payload, s) ~> (result, s')` impls read and
+/// write it across successive op dispatches).
+pub const HANDLER_ACC_KEY: &str = "__acc__";
+
+/// Whether `callee` is a spelling of the `io` module's `perform`
+/// builtin: the flat `perform` or qualified `io.perform` — the names
+/// `ModuleLookup`'s flat-name search resolves to `PerformFn`. Engines
+/// consult [`perform_dispatch`] on these callees before the host
+/// function runs (in-flight dispatch, ADR-0158).
+pub fn is_perform_callee(callee: &str) -> bool {
+    callee == "perform" || callee == "io.perform"
+}
+
+/// Install `s0` as the accumulator slot on a handler record — the
+/// `handle … with h acc s0` frame shape. Non-record handlers pass
+/// through unchanged (a non-record covers no ops anyway).
+pub fn handler_with_acc(handler: &TaggedValue, s0: TaggedValue) -> TaggedValue {
+    if let TaggedValue::Obj(map) = handler {
+        let mut map = (**map).clone();
+        map.insert(Rc::from(HANDLER_ACC_KEY), s0);
+        return TaggedValue::Obj(Rc::new(map));
+    }
+    handler.clone()
+}
+
+/// Read the `__acc__` slot of the innermost handler frame covering `op`
+/// on `stack` — the shared half of [`NativeOpCtx::handler_acc`].
+pub fn covering_frame_acc(stack: &[TaggedValue], op: &str) -> Option<TaggedValue> {
+    stack
+        .iter()
+        .rev()
+        .find(|h| handler_impl(h, op).is_some())?
+        .get(HANDLER_ACC_KEY)
+        .cloned()
+}
+
+/// Write `s'` into the `__acc__` slot of the innermost frame covering
+/// `op` — only frames that carry the slot are written (a covering
+/// acc-less frame is left alone). The shared half of
+/// [`NativeOpCtx::handler_set_acc`].
+pub fn covering_frame_set_acc(stack: &mut [TaggedValue], op: &str, s: TaggedValue) {
+    for h in stack.iter_mut().rev() {
+        if handler_impl(h, op).is_some() {
+            if let TaggedValue::Obj(map) = h {
+                if map.get(HANDLER_ACC_KEY).is_some() {
+                    let mut m = (**map).clone();
+                    m.insert(Rc::from(HANDLER_ACC_KEY), s);
+                    *h = TaggedValue::Obj(Rc::new(m));
+                }
+            }
+            return;
+        }
+    }
+}
+
+/// Split an `acc` impl result into `(result, s')` — accepts the
+/// canonical `Pair` (`***`/`product` values) or a two-element array
+/// (`[result, s']` — the surface spelling, since `(a, b)` is not a pair
+/// literal). Anything else is a contract violation.
+pub fn acc_result_split(out: TaggedValue, op: &str) -> Result<(TaggedValue, TaggedValue), LangError> {
+    match out {
+        TaggedValue::Pair(p) => Ok((p.0.clone(), p.1.clone())),
+        TaggedValue::Arr(xs) if xs.len() == 2 => {
+            Ok((xs[0].clone(), xs[1].clone()))
+        }
+        other => Err(LangError::engine(format!(
+            "perform: acc impl for op '{op}' must return (result, state') — \
+             a pair or 2-element array, got {}",
+            type_tag(&other)
+        ))),
+    }
+}
+
+/// In-flight `perform` dispatch (ADR-0158): `perform(op, arg)` under a
+/// covering handler frame calls `h[op]` and returns its result — the
+/// arrow resumes at the call site. Engines call this at their
+/// host-function dispatch seam when [`is_perform_callee`] matches.
+///
+/// - `Ok(Some(v))` — `op` covered: `v` is the impl's result (the
+///   `perform` resumption value). Under an `acc` frame the impl is
+///   applied as `h[op](arg, s) -> (result, s')` and `s'` is written back
+///   to the frame.
+/// - `Ok(None)` — `op` uncovered (or malformed args): the caller falls
+///   through to `PerformFn`'s residual `IO<{op: arg}>` mint — today's
+///   behavior is the unhandled case.
+pub fn perform_dispatch<C: NativeOpCtx + ?Sized>(
+    ctx: &mut C,
+    args: &[TaggedValue],
+) -> Result<Option<TaggedValue>, LangError> {
+    let op = match args.first() {
+        Some(TaggedValue::Str(s)) => s.to_string(),
+        Some(TaggedValue::Sym(s)) => s.name().to_string(),
+        // Malformed op operand — let `PerformFn`'s own validation report.
+        _ => return Ok(None),
+    };
+    let Some(impl_val) = ctx.handler_lookup(&op) else {
+        return Ok(None);
+    };
+    let arg = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+    Ok(Some(dispatch_covered_op(ctx, &op, &impl_val, arg)?))
+}
+
+/// Apply a covering `impl_val` to `payload`, threading the frame's
+/// `acc` slot when it carries one (ADR-0158): `acc` impls get
+/// `(payload, s) ~> (result, s')` and `s'` is written back to the
+/// frame; plain impls get `h[op](payload)`. Shared by
+/// [`perform_dispatch`] (in-flight) and [`interpret_io_former`]
+/// (residual-trace interpretation).
+pub fn dispatch_covered_op<C: NativeOpCtx + ?Sized>(
+    ctx: &mut C,
+    op: &str,
+    impl_val: &TaggedValue,
+    payload: TaggedValue,
+) -> Result<TaggedValue, LangError> {
+    match ctx.handler_acc(op) {
+        Some(acc) => {
+            // (payload, s) ~> (result, s') — the loop/trace wire.
+            let out = apply_handler_impl(ctx, impl_val, &[payload, acc])?;
+            let (res, s2) = acc_result_split(out, op)?;
+            ctx.handler_set_acc(op, s2);
+            Ok(res)
+        }
+        None => apply_handler_impl(ctx, impl_val, &[payload]),
+    }
+}
+
+// ===========================================================================
+// Multi-shot resumption (`resume`) — shared vocabulary
+// ===========================================================================
+
+/// Reserved object key marking a `resume` value (`{"__resume__": <id>}`),
+/// intercepted by the engines' `apply_app` — same convention as
+/// `__term__`/`__arr__`/`__former__` (multi-shot `resume`, ADR-0158
+/// workstream — `design/multishot-resume.md`). The id indexes the
+/// *minting* engine's suspension table — a `resume` value is only
+/// callable under the engine that minted it (each engine namespaces
+/// its ids).
+pub const RESUME_KEY: &str = "__resume__";
+
+/// Reserved handler-frame key binding a pushed frame to its replay
+/// journal (`{"__journal__": <id>}`), stamped by the journal driver
+/// when it installs the handler — how `perform`/`dispatch_op` find the
+/// journal that owns a covering multi-shot clause, independent of the
+/// frame's mutating `__acc__` slot.
+pub const JOURNAL_FRAME_KEY: &str = "__journal__";
+
+/// Whether an impl value opts into multi-shot dispatch: an arrow value
+/// taking ≥2 params `(payload, resume)`. Serialized-`Term` impls and
+/// 1-ary arrows stay on the one-shot path.
+pub fn impl_takes_resumption(impl_val: &TaggedValue) -> bool {
+    matches!(impl_val, TaggedValue::Arrow { params, .. } if params.len() >= 2)
+}
+
+/// Whether `handler` carries any ≥2-ary clause — the gate for running a
+/// `handle` body under a replay journal. Clause names are `impls`
+/// fields (canonical `handler` record) or the record's own fields
+/// (surface `{op: impl}` spelling); reserved keys (`return`, `__*__`)
+/// are not clauses.
+pub fn handler_has_resumption(handler: &TaggedValue) -> bool {
+    let fields: Vec<TaggedValue> = match handler.get("impls") {
+        Some(TaggedValue::Obj(m)) => m.values().cloned().collect(),
+        _ => match handler {
+            TaggedValue::Obj(m) => m
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__") && k.as_ref() != "return")
+                .map(|(_, v)| v.clone())
+                .collect(),
+            _ => Vec::new(),
+        },
+    };
+    fields.iter().any(impl_takes_resumption)
+}
+
+/// Stamp `journal_id` onto a copy of `handler` — the frame shape the
+/// journal driver installs on the handler stack (see
+/// [`JOURNAL_FRAME_KEY`]).
+pub fn journal_frame_value(handler: &TaggedValue, journal_id: u64) -> TaggedValue {
+    if let TaggedValue::Obj(map) = handler {
+        let mut m = (**map).clone();
+        m.insert(
+            Rc::from(JOURNAL_FRAME_KEY),
+            TaggedValue::Int(journal_id as i64),
+        );
+        return TaggedValue::Obj(Rc::new(m));
+    }
+    handler.clone()
+}
+
+/// Mint a `resume` value bound to suspension `id` — a
+/// `{"__resume__": <id>}` object the engines' `apply_app` drives.
+pub fn mint_resume_value(id: u64) -> TaggedValue {
+    let mut m: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
+    m.insert(Rc::from(RESUME_KEY), TaggedValue::Int(id as i64));
+    TaggedValue::Obj(Rc::new(m))
 }
 
 /// `IO(sig)` effect interpretation (ADR-0153 §4) — the shared port of
@@ -3546,8 +3796,8 @@ fn apply_handler_impl(
 /// handler covers keep their original value — the `IO` object stays
 /// data for outer handlers or user destructuring. A non-IO value (or an
 /// `IO` with no object sig) passes through untouched.
-fn interpret_io_former(
-    ctx: &mut dyn NativeOpCtx,
+pub fn interpret_io_former<C: NativeOpCtx + ?Sized>(
+    ctx: &mut C,
     val: TaggedValue,
 ) -> Result<TaggedValue, LangError> {
     let TaggedValue::Obj(map) = &val else {
@@ -3574,7 +3824,7 @@ fn interpret_io_former(
     let mut out_sig: FxHashMap<Rc<str>, TaggedValue> = (**sig_map).clone();
     for (k, req) in out_sig.clone() {
         if let Some(impl_val) = ctx.handler_lookup(k.as_ref()) {
-            let res = apply_handler_impl(ctx, &impl_val, &req)?;
+            let res = dispatch_covered_op(ctx, k.as_ref(), &impl_val, req)?;
             out_sig.insert(k, res);
         }
     }
@@ -3620,14 +3870,76 @@ fn handle_dyn_shell(ctx: &mut dyn NativeOpCtx) -> OpResult {
     let target_idx = child_at(ctx, "target", 0)?;
     let impl_idx = child_at(ctx, "impl", 1)?;
     let handler = ctx.eval_node(AstRef::new(impl_idx))?;
-    ctx.handler_push(handler.clone());
-    let result = match ctx.eval_node(AstRef::new(target_idx)) {
+    // ADR-0158 `acc` clause: `handle <body> with h acc s0` — the `acc`
+    // child is an optional trailing role (no positional fallback); when
+    // occupied its value seeds the `__acc__` slot on the pushed frame —
+    // the `c` wire of the `(args, s) ~> (result, s')` loop.
+    let acc = ctx
+        .child_role_index_for("acc")
+        .and_then(|pos| children.get(pos).and_then(Value::as_u64))
+        .map(|i| ctx.eval_node(AstRef::new(i as usize)))
+        .transpose()?;
+    let frame_handler = match &acc {
+        Some(s0) => handler_with_acc(&handler, s0.clone()),
+        None => handler.clone(),
+    };
+    ctx.handler_push(frame_handler.clone());
+    // The delimited extent — body eval + `IO` interpretation +
+    // `return`/`acc` postlude + carried attach — is the engine's
+    // [`NativeOpCtx::run_delimited`] hook (it owns the matching pop on
+    // every exit). The default reproduces the previous inline tail;
+    // multi-shot `resume` engines override it to drive suspensions.
+    let val = ctx.run_delimited(
+        AstRef::new(target_idx),
+        &handler,
+        &frame_handler,
+    )?;
+    Ok((val, false))
+}
+
+/// The shared one-shot [`NativeOpCtx::run_delimited`] body: evaluate
+/// `target` under the pushed `frame_handler`, interpret an `IO` former
+/// result through the covering frames, apply the `return`/`acc`
+/// postlude, and attach the carried handler. Owns the pop of the
+/// shell-pushed frame on every exit path. Engines without multi-shot
+/// `resume` delegate their `run_delimited` impl here.
+///
+/// # Errors
+///
+/// Propagates body-eval, `IO`-interpretation, and `return`-clause
+/// errors.
+pub fn run_delimited_default(
+    ctx: &mut dyn NativeOpCtx,
+    target: AstRef,
+    handler: &TaggedValue,
+    frame_handler: &TaggedValue,
+) -> Result<TaggedValue, LangError> {
+    let result = match ctx.eval_node(target) {
         Ok(v) => interpret_io_former(ctx, v),
         Err(e) => Err(e),
     };
-    ctx.handler_pop();
+    // Pop returns the frame so the `acc` slot's final value is visible.
+    let popped = ctx.handler_pop();
     let val = result?;
-    Ok((attach_carried_handler(val, &handler), false))
+    // `return` clause + `acc` final state: `h["return"](r)` (or
+    // `h["return"](r, s_final)` under `acc`) applies to the arrow's
+    // pure result; without `return`, `acc` handles yield the
+    // `(result, s_final)` pair; a plain `handle` passes the result
+    // through. The return clause runs *after* the pop — the algebra's
+    // unit map is outside the handler's own extent.
+    let final_acc = popped
+        .as_ref()
+        .and_then(|f| f.get(HANDLER_ACC_KEY).cloned());
+    let val = match (handler_impl(handler, "return"), final_acc) {
+        (Some(ret), Some(s)) => apply_handler_impl(ctx, &ret, &[val, s])?,
+        (Some(ret), None) => apply_handler_impl(ctx, &ret, &[val])?,
+        (None, Some(s)) => pair(val, s),
+        (None, None) => val,
+    };
+    // The carried handler is the `acc`-seeded record, so each later
+    // application of a handled arrow reinstalls the `__acc__` slot at
+    // `s0` (deep-handler state restarts per application).
+    Ok(attach_carried_handler(val, frame_handler))
 }
 
 // ===========================================================================
