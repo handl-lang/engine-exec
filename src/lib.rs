@@ -23,6 +23,18 @@ pub mod pattern_match;
 
 use std::rc::Rc;
 
+/// Remaining-stack budget at which [`stacker::maybe_grow`] moves the next
+/// recursive helper call onto a fresh segment — shared by the crate's
+/// natively-recursive helpers ([`pattern_match::try_pattern`],
+/// `nat_ctor_depth`) so deep values/patterns are bounded by total
+/// growable stack, not the platform stack. Mirrors
+/// `hnl-engine-typecheck-nbe`.
+pub(crate) const STACK_RED_ZONE: usize = 4 * 1024 * 1024;
+
+/// Fresh stack segment allocated by [`stacker::maybe_grow`] on overflow
+/// (see [`STACK_RED_ZONE`]).
+pub(crate) const STACK_SEGMENT: usize = 8 * 1024 * 1024;
+
 use handl_language::{Ast, LangError, Language, Value};
 use handl_value::TaggedValue;
 
@@ -269,7 +281,7 @@ mod tests {
         let e1 = Eval;
         let e2 = Eval;
         assert_eq!(e1, e2);
-        let e3 = Eval::default();
+        let e3 = Eval;
         assert_eq!(e1, e3);
     }
 
@@ -351,6 +363,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     /// Helper: call a [`Function`] with a fresh [`EvalContext`].
     fn call_fn(f: &dyn Function, args: &[Value]) -> Result<Value, handl_platform::EvalError> {
         let mut ctx = EvalContext::new();

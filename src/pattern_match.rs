@@ -170,39 +170,56 @@ pub fn try_pattern(
     scrut: &TaggedValue,
     ctx: &mut impl PatternMatchCtx,
 ) -> Result<bool, LangError> {
+    // Growable-stack seam (`crate::STACK_RED_ZONE`): nested
+    // array/object/tag/ctor patterns recurse through the sub-pattern
+    // helpers back into `try_pattern`, so checking at this one funnel
+    // bounds every level.
+    stacker::maybe_grow(crate::STACK_RED_ZONE, crate::STACK_SEGMENT, || {
+        try_pattern_inner(ast, pattern_ref, scrut, ctx)
+    })
+}
+
+/// The recursive body of [`try_pattern`], run under
+/// [`stacker::maybe_grow`].
+fn try_pattern_inner(
+    ast: &Ast,
+    pattern_ref: AstRef,
+    scrut: &TaggedValue,
+    ctx: &mut impl PatternMatchCtx,
+) -> Result<bool, LangError> {
     let pattern_node = ast.at(pattern_ref)?;
     let lang = ctx.lang();
     // Leaf binder pattern — `pattern_role: leaf` (canonical `var`; the
     // `var` kind name is the role-less fallback).
-    if is_binder_node(lang, pattern_node) {
-        if let Some(name) = pattern_node.payload.as_str() {
-            if is_wildcard_name(name) {
-                // Wildcard — always matches, binds nothing.
-                return Ok(true);
-            }
-            // Value pattern — an ambient global (e.g. `true`/`false`
-            // seeded from `Language::globals`) matches by equality rather
-            // than binding.
-            if let Some(global) = ctx.global_value(name) {
-                return Ok(handl_value::eq(&global, scrut));
-            }
-            // Constructor value pattern (ADR-0152): a `var` naming a
-            // scope-bound canonical ctor object (`{"__ctor__": sym, …}`)
-            // is the 0-argument constructor pattern — `VNil:` in
-            // `match v { VNil: a, VCons(x, xs): b }`. It matches by
-            // equality (the seeded `__ctor__` syms compare by handle), so
-            // the arm only fires on that constructor's values. A name
-            // resolving to a non-ctor value is not a value pattern — it
-            // falls through and binds, preserving shadowing.
-            if let Some(scoped) = ctx.scope_value(name) {
-                if is_ctor_object(&scoped) {
-                    return Ok(handl_value::eq(&scoped, scrut));
-                }
-            }
-            // Binder — always matches, binds name → scrutinee.
-            ctx.define_binding(name, scrut.clone());
+    if is_binder_node(lang, pattern_node)
+        && let Some(name) = pattern_node.payload.as_str()
+    {
+        if is_wildcard_name(name) {
+            // Wildcard — always matches, binds nothing.
             return Ok(true);
         }
+        // Value pattern — an ambient global (e.g. `true`/`false`
+        // seeded from `Language::globals`) matches by equality rather
+        // than binding.
+        if let Some(global) = ctx.global_value(name) {
+            return Ok(handl_value::eq(&global, scrut));
+        }
+        // Constructor value pattern (ADR-0152): a `var` naming a
+        // scope-bound canonical ctor object (`{"__ctor__": sym, …}`)
+        // is the 0-argument constructor pattern — `VNil:` in
+        // `match v { VNil: a, VCons(x, xs): b }`. It matches by
+        // equality (the seeded `__ctor__` syms compare by handle), so
+        // the arm only fires on that constructor's values. A name
+        // resolving to a non-ctor value is not a value pattern — it
+        // falls through and binds, preserving shadowing.
+        if let Some(scoped) = ctx.scope_value(name)
+            && is_ctor_object(&scoped)
+        {
+            return Ok(handl_value::eq(&scoped, scrut));
+        }
+        // Binder — always matches, binds name → scrutinee.
+        ctx.define_binding(name, scrut.clone());
+        return Ok(true);
     }
     // Array destructuring pattern (`pattern_role: sequence`): [a, b, ...rest]
     if pattern_role_is(lang, pattern_node, "sequence", "array") {
@@ -240,7 +257,7 @@ fn rest_binder_name(
         .get("children")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            LangError::engine_node("rest pattern: missing children".to_string(), &rest_node)
+            LangError::engine_node("rest pattern: missing children".to_string(), rest_node)
         })?;
     // The binder sits at the `subject` role (index 0 on canonical `rest`).
     let subject_idx = child_idx(lang, rest_node, "subject", 0);
@@ -248,20 +265,20 @@ fn rest_binder_name(
         .get(subject_idx)
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            LangError::engine_node("rest pattern: missing binder".to_string(), &rest_node)
+            LangError::engine_node("rest pattern: missing binder".to_string(), rest_node)
         })?;
     let var_node = ast.at(AstRef::new(var_idx as usize))?;
-    if is_binder_node(lang, var_node) {
-        if let Some(name) = var_node.payload.as_str() {
-            if is_wildcard_name(name) {
-                return Ok(None); // Wildcard rest — binds nothing.
-            }
-            return Ok(Some(name.to_string()));
+    if is_binder_node(lang, var_node)
+        && let Some(name) = var_node.payload.as_str()
+    {
+        if is_wildcard_name(name) {
+            return Ok(None); // Wildcard rest — binds nothing.
         }
+        return Ok(Some(name.to_string()));
     }
     Err(LangError::engine_node(
         "rest pattern: binder is not a var".to_string(),
-        &rest_node,
+        rest_node,
     ))
 }
 
@@ -282,7 +299,7 @@ fn try_array_pattern(
         .get("children")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            LangError::engine_node("array pattern: missing children".to_string(), &pattern_node)
+            LangError::engine_node("array pattern: missing children".to_string(), pattern_node)
         })?;
     let scrut_arr = match scrut {
         TaggedValue::Arr(a) => a,
@@ -294,14 +311,14 @@ fn try_array_pattern(
     let mut positional: Vec<usize> = Vec::new();
     for child in children {
         let idx = child.as_u64().ok_or_else(|| {
-            LangError::engine_node("array pattern: bad child index".to_string(), &pattern_node)
+            LangError::engine_node("array pattern: bad child index".to_string(), pattern_node)
         })? as usize;
         let child_node = ast.at(AstRef::new(idx))?;
         if pattern_role_is(ctx.lang(), child_node, "rest", "rest") {
             if rest_idx.is_some() {
                 return Err(LangError::engine_node(
                     "array pattern: multiple rest patterns".to_string(),
-                    &pattern_node,
+                    pattern_node,
                 ));
             }
             rest_idx = Some(idx);
@@ -326,11 +343,11 @@ fn try_array_pattern(
     }
 
     // Bind remaining elements to the rest binder.
-    if let Some(ridx) = rest_idx {
-        if let Some(name) = rest_binder_name(ast, ctx.lang(), AstRef::new(ridx))? {
-            let rest_vals: Vec<TaggedValue> = scrut_arr[n..].to_vec();
-            ctx.define_binding(&name, TaggedValue::Arr(Rc::from(rest_vals)));
-        }
+    if let Some(ridx) = rest_idx
+        && let Some(name) = rest_binder_name(ast, ctx.lang(), AstRef::new(ridx))?
+    {
+        let rest_vals: Vec<TaggedValue> = scrut_arr[n..].to_vec();
+        ctx.define_binding(&name, TaggedValue::Arr(Rc::from(rest_vals)));
     }
 
     Ok(true)
@@ -364,10 +381,7 @@ fn try_object_pattern(
         .get("children")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            LangError::engine_node(
-                "object pattern: missing children".to_string(),
-                &pattern_node,
-            )
+            LangError::engine_node("object pattern: missing children".to_string(), pattern_node)
         })?;
     // The scrutinee's fields, via the tagged-object view: `Obj`
     // destructures in place; an opaque variant's wire record
@@ -454,15 +468,15 @@ fn try_object_pattern(
     }
 
     // Bind remaining keys to the rest binder.
-    if let Some(ridx) = rest_idx {
-        if let Some(name) = rest_binder_name(ast, ctx.lang(), AstRef::new(ridx))? {
-            let rest_obj: FxHashMap<Rc<str>, TaggedValue> = scrut_obj
-                .iter()
-                .filter(|(k, _)| !matched_keys.iter().any(|m| m.as_str() == k.as_ref()))
-                .map(|(k, v)| (Rc::clone(k), v.clone()))
-                .collect();
-            ctx.define_binding(&name, TaggedValue::Obj(Rc::new(rest_obj)));
-        }
+    if let Some(ridx) = rest_idx
+        && let Some(name) = rest_binder_name(ast, ctx.lang(), AstRef::new(ridx))?
+    {
+        let rest_obj: FxHashMap<Rc<str>, TaggedValue> = scrut_obj
+            .iter()
+            .filter(|(k, _)| !matched_keys.iter().any(|m| m.as_str() == k.as_ref()))
+            .map(|(k, v)| (Rc::clone(k), v.clone()))
+            .collect();
+        ctx.define_binding(&name, TaggedValue::Obj(Rc::new(rest_obj)));
     }
 
     Ok(true)
@@ -491,7 +505,7 @@ fn try_tag_pattern(
         .get("children")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            LangError::engine_node("tag pattern: missing children".to_string(), &pattern_node)
+            LangError::engine_node("tag pattern: missing children".to_string(), pattern_node)
         })?;
     // The `callee` role (index 0 on canonical `call`) carries the tag
     // name; the `args` role (index 1) and onward are the binders.
@@ -499,14 +513,11 @@ fn try_tag_pattern(
         .get(child_idx(ctx.lang(), pattern_node, "callee", 0))
         .and_then(|v| v.as_u64())
         .ok_or_else(|| {
-            LangError::engine_node("tag pattern: missing callee".to_string(), &pattern_node)
+            LangError::engine_node("tag pattern: missing callee".to_string(), pattern_node)
         })? as usize;
     let callee_node = ast.at(AstRef::new(callee_idx))?;
     let tag_name = callee_node.payload.as_str().ok_or_else(|| {
-        LangError::engine_node(
-            "tag pattern: callee is not a var".to_string(),
-            &pattern_node,
-        )
+        LangError::engine_node("tag pattern: callee is not a var".to_string(), pattern_node)
     })?;
     // Check scrutinee is a tagged value with matching tag name.
     let scrut_obj = match scrut {
@@ -543,7 +554,7 @@ fn try_tag_pattern(
         .skip(child_idx(ctx.lang(), pattern_node, "args", 1))
         .map(|c| -> Result<usize, LangError> {
             let idx = c.as_u64().ok_or_else(|| {
-                LangError::engine_node("tag pattern: bad binder index".to_string(), &pattern_node)
+                LangError::engine_node("tag pattern: bad binder index".to_string(), pattern_node)
             })?;
             Ok(idx as usize)
         })
@@ -553,27 +564,27 @@ fn try_tag_pattern(
     if binder_indices.len() == 1 && payload_fields.len() == 1 {
         let binder_idx = binder_indices[0];
         let binder_node = ast.at(AstRef::new(binder_idx))?;
-        if is_binder_node(ctx.lang(), binder_node) {
-            if let Some(name) = binder_node.payload.as_str() {
-                if is_wildcard_name(name) {
-                    return Ok(true); // Wildcard
-                }
-                ctx.define_binding(name, payload_fields[0].1.clone());
-                return Ok(true);
+        if is_binder_node(ctx.lang(), binder_node)
+            && let Some(name) = binder_node.payload.as_str()
+        {
+            if is_wildcard_name(name) {
+                return Ok(true); // Wildcard
             }
+            ctx.define_binding(name, payload_fields[0].1.clone());
+            return Ok(true);
         }
     }
     // General case: positional binding of payload fields to binders.
     for (i, &binder_idx) in binder_indices.iter().enumerate() {
         let binder_node = ast.at(AstRef::new(binder_idx))?;
-        if is_binder_node(ctx.lang(), binder_node) {
-            if let Some(name) = binder_node.payload.as_str() {
-                if is_wildcard_name(name) {
-                    continue; // Wildcard
-                }
-                if let Some(&(_, val)) = payload_fields.get(i) {
-                    ctx.define_binding(name, val.clone());
-                }
+        if is_binder_node(ctx.lang(), binder_node)
+            && let Some(name) = binder_node.payload.as_str()
+        {
+            if is_wildcard_name(name) {
+                continue; // Wildcard
+            }
+            if let Some(&(_, val)) = payload_fields.get(i) {
+                ctx.define_binding(name, val.clone());
             }
         }
     }
@@ -651,18 +662,18 @@ fn try_ctor_object_pattern(
     }
     for (i, &binder_idx) in binder_indices.iter().enumerate() {
         let binder_node = ast.at(AstRef::new(binder_idx))?;
-        if is_binder_node(ctx.lang(), binder_node) {
-            if let Some(name) = binder_node.payload.as_str() {
-                if is_wildcard_name(name) {
-                    continue; // Wildcard
-                }
-                let val = match &declared {
-                    Some(fields) => fields.get(i).and_then(|f| scrut_obj.get(f.as_str())),
-                    None => sorted_fields.get(i).map(|(_, v)| *v),
-                };
-                if let Some(v) = val {
-                    ctx.define_binding(name, v.clone());
-                }
+        if is_binder_node(ctx.lang(), binder_node)
+            && let Some(name) = binder_node.payload.as_str()
+        {
+            if is_wildcard_name(name) {
+                continue; // Wildcard
+            }
+            let val = match &declared {
+                Some(fields) => fields.get(i).and_then(|f| scrut_obj.get(f.as_str())),
+                None => sorted_fields.get(i).map(|(_, v)| *v),
+            };
+            if let Some(v) = val {
+                ctx.define_binding(name, v.clone());
             }
         }
     }

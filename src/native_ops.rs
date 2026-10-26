@@ -27,8 +27,8 @@
 
 use std::rc::Rc;
 
-use crate::pattern_match::is_ctor_object;
 use crate::ImportResolver;
+use crate::pattern_match::is_ctor_object;
 use handl_language::{AstRef, LangError, Value};
 use handl_value::{
     Sym, TaggedValue, cell_comp_axis, cell_compose, cell2_comp_v, cell2_id, cell2_src, cell2_tgt,
@@ -161,11 +161,7 @@ fn nat_ctor_depth(v: &TaggedValue) -> Option<i64> {
 /// [`stacker::maybe_grow`].
 fn nat_ctor_depth_inner(v: &TaggedValue) -> Option<i64> {
     let obj = match v {
-        TaggedValue::Obj(o)
-            if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) =>
-        {
-            o
-        }
+        TaggedValue::Obj(o) if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) => o,
         _ => return None,
     };
     let former = match obj.get("type") {
@@ -174,9 +170,7 @@ fn nat_ctor_depth_inner(v: &TaggedValue) -> Option<i64> {
     };
     let former = former?;
     let same_former_link = |val: &TaggedValue| match val {
-        TaggedValue::Obj(o)
-            if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) =>
-        {
+        TaggedValue::Obj(o) if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))) => {
             match o.get("type") {
                 Some(TaggedValue::Obj(t)) => {
                     matches!(t.get("__former__"), Some(f) if handl_value::eq(f, &former))
@@ -982,67 +976,65 @@ pub fn apply_native_op(
                     }
                 };
                 let child = AstRef::new(idx);
-                if is_assign_node(ctx, child) {
-                    if let Some(ac) = node_children(ctx, child) {
-                        if ac.len() == 2 {
-                            // Binding target/value by child role
-                            // (ADR-0081), falling back to the positional
-                            // children for role-less shapes.
-                            let var_idx = match role_child_arena(ctx, child, "target")
-                                .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                if is_assign_node(ctx, child)
+                    && let Some(ac) = node_children(ctx, child)
+                    && ac.len() == 2
+                {
+                    // Binding target/value by child role
+                    // (ADR-0081), falling back to the positional
+                    // children for role-less shapes.
+                    let var_idx = match role_child_arena(ctx, child, "target")
+                        .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                    {
+                        Some(i) => i,
+                        None => {
+                            eval_err = Some(LangError::engine(
+                                "eval_block: assign var index must be a number".to_string(),
+                            ));
+                            break 'block;
+                        }
+                    };
+                    let value_idx = match role_child_arena(ctx, child, "value")
+                        .or_else(|| ac[1].as_u64().map(|i| i as usize))
+                    {
+                        Some(i) => i,
+                        None => {
+                            eval_err = Some(LangError::engine(
+                                "eval_block: assign value index must be a number".to_string(),
+                            ));
+                            break 'block;
+                        }
+                    };
+                    let var_name = match binding_target_name(ctx, var_idx, "eval_block") {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eval_err = Some(e);
+                            break 'block;
+                        }
+                    };
+                    match ctx.eval_node(AstRef::new(value_idx)) {
+                        Ok(value) => {
+                            // Self-referential `x = …x…`/`x := …x…`
+                            // in a block: bind `x` to a self-ref
+                            // marker in the arrow's `binds` (see
+                            // `assign`).
+                            let value = if handl_language::subtree_name_candidates(
+                                |r| ctx.node_payload_at(r),
+                                AstRef::new(value_idx),
+                            )
+                            .is_some_and(|n| n.contains(var_name.as_str()))
                             {
-                                Some(i) => i,
-                                None => {
-                                    eval_err = Some(LangError::engine(
-                                        "eval_block: assign var index must be a number".to_string(),
-                                    ));
-                                    break 'block;
-                                }
+                                handl_value::with_self_ref_bind(&value, &var_name)
+                            } else {
+                                value
                             };
-                            let value_idx = match role_child_arena(ctx, child, "value")
-                                .or_else(|| ac[1].as_u64().map(|i| i as usize))
-                            {
-                                Some(i) => i,
-                                None => {
-                                    eval_err = Some(LangError::engine(
-                                        "eval_block: assign value index must be a number"
-                                            .to_string(),
-                                    ));
-                                    break 'block;
-                                }
-                            };
-                            let var_name = match binding_target_name(ctx, var_idx, "eval_block") {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    eval_err = Some(e);
-                                    break 'block;
-                                }
-                            };
-                            match ctx.eval_node(AstRef::new(value_idx)) {
-                                Ok(value) => {
-                                    // Self-referential `x = …x…`/`x := …x…`
-                                    // in a block: bind `x` to a self-ref
-                                    // marker in the arrow's `binds` (see
-                                    // `assign`).
-                                    let value = if handl_language::subtree_name_candidates(
-                                        |r| ctx.node_payload_at(r),
-                                        AstRef::new(value_idx),
-                                    )
-                                    .is_some_and(|n| n.contains(var_name.as_str()))
-                                    {
-                                        handl_value::with_self_ref_bind(&value, &var_name)
-                                    } else {
-                                        value
-                                    };
-                                    ctx.env_assign(&var_name, value.clone());
-                                    result = value;
-                                    continue 'block;
-                                }
-                                Err(e) => {
-                                    eval_err = Some(e);
-                                    break 'block;
-                                }
-                            }
+                            ctx.env_assign(&var_name, value.clone());
+                            result = value;
+                            continue 'block;
+                        }
+                        Err(e) => {
+                            eval_err = Some(e);
+                            break 'block;
                         }
                     }
                 }
@@ -1270,10 +1262,7 @@ pub fn apply_native_op(
                 // Keeping the ctor object in `binds` preserves the
                 // value-pattern's name reference (and term positions
                 // resolve it through `lookup` just as well).
-                if rec_names.contains(name)
-                    || !arrow_free(value)
-                    || is_ctor_object(value)
-                {
+                if rec_names.contains(name) || !arrow_free(value) || is_ctor_object(value) {
                     binds.insert(Rc::clone(name), value.clone());
                 } else {
                     subst.insert(Rc::clone(name), handl_value::tagged_to_value(value));
@@ -1310,10 +1299,7 @@ pub fn apply_native_op(
                 if let Some(elements) = payload.get("elements") {
                     return Ok(Some((TaggedValue::from(elements.clone()), false)));
                 }
-                return Ok(Some((
-                    TaggedValue::Arr(Rc::from(args.to_vec())),
-                    false,
-                )));
+                return Ok(Some((TaggedValue::Arr(Rc::from(args.to_vec())), false)));
             }
             if let Some(elements) = payload.get("elements") {
                 return Ok(Some((TaggedValue::from(elements.clone()), false)));
@@ -1387,7 +1373,7 @@ pub fn apply_native_op(
                     obj.insert(Rc::from(key), arg.clone());
                 }
             } else {
-                if args.len() % 2 != 0 {
+                if !args.len().is_multiple_of(2) {
                     return Err(LangError::engine(format!(
                         "record: expected even number of arguments, got {}",
                         args.len()
@@ -1395,9 +1381,7 @@ pub fn apply_native_op(
                 }
                 for i in (0..args.len()).step_by(2) {
                     let key = args[i].as_str().ok_or_else(|| {
-                        LangError::engine(format!(
-                            "record: key at index {i} must be a string"
-                        ))
+                        LangError::engine(format!("record: key at index {i} must be a string"))
                     })?;
                     obj.insert(Rc::from(key), args[i + 1].clone());
                 }
@@ -1605,9 +1589,8 @@ pub fn apply_native_op(
                     _ => None,
                 },
             };
-            out.map(|v| (v, false)).ok_or_else(|| {
-                LangError::engine(format!("elem: index {idx} out of bounds"))
-            })
+            out.map(|v| (v, false))
+                .ok_or_else(|| LangError::engine(format!("elem: index {idx} out of bounds")))
         }
         "paren" => {
             if !ctx.supports(OpService::EvalNode) {
@@ -1743,12 +1726,12 @@ pub fn apply_native_op(
                 if let Some(inc) = incoming.as_ref() {
                     if let Some(snd) = pair_snd(inc) {
                         if let Some(arr) = snd.as_array() {
-                            arr.iter().cloned().collect()
+                            arr.to_vec()
                         } else {
                             vec![snd.clone()]
                         }
                     } else if let Some(arr) = inc.as_array() {
-                        arr.iter().cloned().collect()
+                        arr.to_vec()
                     } else {
                         vec![inc.clone()]
                     }
@@ -1756,7 +1739,7 @@ pub fn apply_native_op(
                     vec![]
                 }
             } else {
-                args.iter().cloned().collect()
+                args.to_vec()
             };
             if operands.len() < 2 {
                 return Err(LangError::engine(
@@ -1963,10 +1946,7 @@ pub fn apply_native_op(
             let v = args
                 .first()
                 .ok_or_else(|| LangError::engine("obj_key: missing argument".to_string()))?;
-            Ok((
-                TaggedValue::Str(Rc::from(v.as_str().unwrap_or(""))),
-                false,
-            ))
+            Ok((TaggedValue::Str(Rc::from(v.as_str().unwrap_or(""))), false))
         }
         // `has_field[:k]` — the input is an object *and* carries key
         // `k`. Two surfaces: `lit` is the static key (the
@@ -2032,9 +2012,7 @@ pub fn apply_native_op(
                 .unwrap_or(TaggedValue::Null);
             let name = match &v {
                 TaggedValue::Obj(map) => match map.get("__ctor__") {
-                    Some(TaggedValue::Sym(s)) => {
-                        TaggedValue::Str(Rc::from(s.name()))
-                    }
+                    Some(TaggedValue::Sym(s)) => TaggedValue::Str(Rc::from(s.name())),
                     _ => TaggedValue::Null,
                 },
                 _ => TaggedValue::Null,
@@ -2056,9 +2034,7 @@ pub fn apply_native_op(
                 TaggedValue::Obj(map) => {
                     let mut fields: Vec<(&Rc<str>, &TaggedValue)> = map
                         .iter()
-                        .filter(|(k, _)| {
-                            k.as_ref() != "__ctor__" && k.as_ref() != "type"
-                        })
+                        .filter(|(k, _)| k.as_ref() != "__ctor__" && k.as_ref() != "type")
                         .collect();
                     fields.sort_by(|a, b| a.0.cmp(b.0));
                     let vals: Vec<TaggedValue> =
@@ -2095,7 +2071,7 @@ pub fn apply_native_op(
                         _ => {
                             return Err(LangError::engine(
                                 "obj_except: keys are not an array".to_string(),
-                            ))
+                            ));
                         }
                     };
                     (args[0].clone(), ks)
@@ -2111,7 +2087,10 @@ pub fn apply_native_op(
             };
             let mut out: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
             for (k, v) in map.iter() {
-                if !keys.iter().any(|k2| k2.as_str().unwrap_or("") == k.as_ref()) {
+                if !keys
+                    .iter()
+                    .any(|k2| k2.as_str().unwrap_or("") == k.as_ref())
+                {
                     out.insert(k.clone(), v.clone());
                 }
             }
@@ -2266,9 +2245,7 @@ pub fn apply_native_op(
                 let field_val = inner
                     .get(field_name)
                     .cloned()
-                    .or_else(|| {
-                        view_fields(&inner).and_then(|m| m.get(field_name).cloned())
-                    })
+                    .or_else(|| view_fields(&inner).and_then(|m| m.get(field_name).cloned()))
                     .unwrap_or(TaggedValue::Null);
                 Ok((opt_some(field_val), false))
             } else if input.get("_tag").and_then(|t| t.as_str()) == Some("None") {
@@ -2277,9 +2254,7 @@ pub fn apply_native_op(
                 let field_val = input
                     .get(field_name)
                     .cloned()
-                    .or_else(|| {
-                        view_fields(&input).and_then(|m| m.get(field_name).cloned())
-                    })
+                    .or_else(|| view_fields(&input).and_then(|m| m.get(field_name).cloned()))
                     .unwrap_or(TaggedValue::Null);
                 Ok((opt_some(field_val), false))
             }
@@ -2361,9 +2336,7 @@ pub fn apply_native_op(
                     map.get(key.as_ref())
                         .cloned()
                         .map(|v| (v, false))
-                        .ok_or_else(|| {
-                            LangError::engine(format!("index: key '{}' not found", key))
-                        })
+                        .ok_or_else(|| LangError::engine(format!("index: key '{}' not found", key)))
                 }
                 (target, index) => Err(LangError::engine(format!(
                     "index: target must be array/object and index must be number/string; got {} and {}",
@@ -2509,35 +2482,34 @@ pub fn apply_native_op(
                 .and_then(|p| p.get("children"))
                 .and_then(|c| c.as_array())
                 .cloned();
-            if let Some(children) = children {
-                if children.len() >= 2 {
-                    if !ctx.supports(OpService::EvalNode) {
-                        return Ok(None);
-                    }
-                    let template_idx = children[0].as_u64().ok_or_else(|| {
+            if let Some(children) = children
+                && children.len() >= 2
+            {
+                if !ctx.supports(OpService::EvalNode) {
+                    return Ok(None);
+                }
+                let template_idx = children[0].as_u64().ok_or_else(|| {
+                    LangError::engine("json: child index must be a number".to_string())
+                })? as usize;
+                let template = ctx
+                    .node_payload_at(AstRef::new(template_idx))
+                    .and_then(|p| p.as_str().map(str::to_string))
+                    .ok_or_else(|| {
+                        LangError::engine("json: template payload must be a string".to_string())
+                    })?;
+                let mut s = template;
+                for (i, entry) in children[1..].iter().enumerate() {
+                    let idx = entry.as_u64().ok_or_else(|| {
                         LangError::engine("json: child index must be a number".to_string())
                     })? as usize;
-                    let template = ctx
-                        .node_payload_at(AstRef::new(template_idx))
-                        .and_then(|p| p.as_str().map(str::to_string))
-                        .ok_or_else(|| {
-                            LangError::engine("json: template payload must be a string".to_string())
-                        })?;
-                    let mut s = template;
-                    for (i, entry) in children[1..].iter().enumerate() {
-                        let idx = entry.as_u64().ok_or_else(|| {
-                            LangError::engine("json: child index must be a number".to_string())
-                        })? as usize;
-                        let val = ctx.eval_node(AstRef::new(idx))?;
-                        let replacement =
-                            serde_json::to_string(&handl_value::tagged_to_value(&val))
-                                .map_err(|e| LangError::engine(format!("json: {}", e)))?;
-                        s = s.replace(&format!("${}", i), &replacement);
-                    }
-                    return serde_json::from_str::<Value>(&s)
-                        .map_err(|e| LangError::engine(format!("json: parse error: {}", e)))
-                        .map(|v| Some((TaggedValue::from(v), false)));
+                    let val = ctx.eval_node(AstRef::new(idx))?;
+                    let replacement = serde_json::to_string(&handl_value::tagged_to_value(&val))
+                        .map_err(|e| LangError::engine(format!("json: {}", e)))?;
+                    s = s.replace(&format!("${}", i), &replacement);
                 }
+                return serde_json::from_str::<Value>(&s)
+                    .map_err(|e| LangError::engine(format!("json: parse error: {}", e)))
+                    .map(|v| Some((TaggedValue::from(v), false)));
             }
             let expr = ctx
                 .node_payload()
@@ -2592,7 +2564,7 @@ pub fn apply_native_op(
             if !matches!(pred_val, TaggedValue::Arrow { .. }) {
                 return Ok(Some((expr_val, false)));
             }
-            let check_result = ctx.apply_arrow(&pred_val, &[expr_val.clone()])?;
+            let check_result = ctx.apply_arrow(&pred_val, std::slice::from_ref(&expr_val))?;
             if is_truthy(&check_result) {
                 Ok((expr_val, false))
             } else {
@@ -2772,7 +2744,7 @@ pub fn apply_native_op(
                 ctx.env_define(&alias, (*bindings).clone());
             } else if let TaggedValue::Obj(map) = &*bindings {
                 for (name, val) in map.iter() {
-                    ctx.env_define(&**name, val.clone());
+                    ctx.env_define(name, val.clone());
                 }
             }
             // `import` is a statement; it produces no value.
@@ -3077,27 +3049,25 @@ fn binding_target_name(
             if let Some(field) = payload.get("field").and_then(|v| v.as_str()) {
                 return Some(field.to_string());
             }
-            if let Some(raw) = children.get(field_pos).and_then(|v| v.as_u64()) {
-                if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
-                    return Some(name);
-                }
+            if let Some(raw) = children.get(field_pos).and_then(|v| v.as_u64())
+                && let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1)
+            {
+                return Some(name);
             }
         }
         // `callee` — a `call` target binds the callee head's name.
-        if let Some(callee_pos) = ctx.child_role_index_at(r, "callee") {
-            if let Some(raw) = children.get(callee_pos).and_then(|v| v.as_u64()) {
-                if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
-                    return Some(name);
-                }
-            }
+        if let Some(callee_pos) = ctx.child_role_index_at(r, "callee")
+            && let Some(raw) = children.get(callee_pos).and_then(|v| v.as_u64())
+            && let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1)
+        {
+            return Some(name);
         }
         for role in ["source", "target", "subject", "params", "body", "expr"] {
-            if let Some(pos) = ctx.child_role_index_at(r, role) {
-                if let Some(raw) = children.get(pos).and_then(|v| v.as_u64()) {
-                    if let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1) {
-                        return Some(name);
-                    }
-                }
+            if let Some(pos) = ctx.child_role_index_at(r, role)
+                && let Some(raw) = children.get(pos).and_then(|v| v.as_u64())
+                && let Some(name) = resolve(ctx, AstRef::new(raw as usize), depth - 1)
+            {
+                return Some(name);
             }
         }
         None
@@ -3179,20 +3149,17 @@ fn eval_rec_region(
             LangError::engine("eval_rec: child index must be a number".to_string())
         })? as usize;
         let child = AstRef::new(child_idx);
-        if is_assign_node(ctx, child) {
-            if let Some(ac) = node_children(ctx, child) {
-                if ac.len() >= 2 {
-                    let var_idx = role_child_arena(ctx, child, "target")
-                        .or_else(|| ac[0].as_u64().map(|i| i as usize))
-                        .ok_or_else(|| {
-                            LangError::engine(
-                                "eval_rec: assign var index must be a number".to_string(),
-                            )
-                        })?;
-                    if let Ok(name) = binding_target_name(ctx, var_idx, "eval_rec") {
-                        binding_names.push(Rc::from(name.as_str()));
-                    }
-                }
+        if is_assign_node(ctx, child)
+            && let Some(ac) = node_children(ctx, child)
+            && ac.len() >= 2
+        {
+            let var_idx = role_child_arena(ctx, child, "target")
+                .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                .ok_or_else(|| {
+                    LangError::engine("eval_rec: assign var index must be a number".to_string())
+                })?;
+            if let Ok(name) = binding_target_name(ctx, var_idx, "eval_rec") {
+                binding_names.push(Rc::from(name.as_str()));
             }
         }
     }
@@ -3235,10 +3202,10 @@ fn eval_rec_region_loop(
 
             // `return` — exit the region with the return value.
             if is_return_node(ctx, child) {
-                if let Some(rc) = node_children(ctx, child) {
-                    if let Some(ret_idx) = rc.first().and_then(|v| v.as_u64()) {
-                        return ctx.eval_node(AstRef::new(ret_idx as usize));
-                    }
+                if let Some(rc) = node_children(ctx, child)
+                    && let Some(ret_idx) = rc.first().and_then(|v| v.as_u64())
+                {
+                    return ctx.eval_node(AstRef::new(ret_idx as usize));
                 }
                 // `return` with no value → exit with Null.
                 return Ok(TaggedValue::Null);
@@ -3249,55 +3216,61 @@ fn eval_rec_region_loop(
             // binding may reference another not-yet-computed binding
             // (still unbound or Null), which would error. The binding is
             // skipped for this pass and retried next pass.
-            if is_assign_node(ctx, child) {
-                if let Some(ac) = node_children(ctx, child) {
-                    if ac.len() >= 2 {
-                        let var_idx = role_child_arena(ctx, child, "target")
-                            .or_else(|| ac[0].as_u64().map(|i| i as usize))
-                            .ok_or_else(|| {
-                                LangError::engine(
-                                    "eval_rec: assign var index must be a number".to_string(),
-                                )
-                            })?;
-                        let value_idx = role_child_arena(ctx, child, "value")
-                            .or_else(|| ac[1].as_u64().map(|i| i as usize))
-                            .ok_or_else(|| {
-                                LangError::engine(
-                                    "eval_rec: assign value index must be a number".to_string(),
-                                )
-                            })?;
-                        let var_name = binding_target_name(ctx, var_idx, "eval_rec")?;
-                        match ctx.eval_node(AstRef::new(value_idx)) {
-                            Ok(new_val) => {
-                                // Self-referential arrow in a rec region:
-                                // bind `var_name` to a self-ref marker in
-                                // the arrow's `binds` (see `assign`).
-                                let new_val = if handl_language::subtree_name_candidates(
-                                    |r| ctx.node_payload_at(r),
-                                    AstRef::new(value_idx),
-                                )
-                                .is_some_and(|n| n.contains(var_name.as_str()))
-                                {
-                                    handl_value::with_self_ref_bind(&new_val, &var_name)
-                                } else {
-                                    new_val
-                                };
-                                ctx.env_define(&var_name, new_val.clone());
-                                result = new_val;
-                            }
-                            Err(_) => {
-                                // Skip — binding couldn't be computed
-                                // this pass (likely references a
-                                // not-yet-computed binding). Discard any
-                                // deferred error the failed eval left
-                                // behind (cranelift `ctx.error`) so it
-                                // does not leak into the next pass.
-                                ctx.clear_eval_error();
-                            }
+            if is_assign_node(ctx, child)
+                && let Some(ac) = node_children(ctx, child)
+                && ac.len() >= 2
+            {
+                let var_idx = role_child_arena(ctx, child, "target")
+                    .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                    .ok_or_else(|| {
+                        LangError::engine("eval_rec: assign var index must be a number".to_string())
+                    })?;
+                let value_idx = role_child_arena(ctx, child, "value")
+                    .or_else(|| ac[1].as_u64().map(|i| i as usize))
+                    .ok_or_else(|| {
+                        LangError::engine(
+                            "eval_rec: assign value index must be a number".to_string(),
+                        )
+                    })?;
+                let var_name = binding_target_name(ctx, var_idx, "eval_rec")?;
+                match ctx.eval_node(AstRef::new(value_idx)) {
+                    Ok(new_val) => {
+                        // Self-referential arrow in a rec region:
+                        // bind `var_name` to a self-ref marker in
+                        // the arrow's `binds` (see `assign`).
+                        let new_val = if handl_language::subtree_name_candidates(
+                            |r| ctx.node_payload_at(r),
+                            AstRef::new(value_idx),
+                        )
+                        .is_some_and(|n| n.contains(var_name.as_str()))
+                        {
+                            handl_value::with_self_ref_bind(&new_val, &var_name)
+                        } else {
+                            new_val
+                        };
+                        ctx.env_define(&var_name, new_val.clone());
+                        result = new_val;
+                    }
+                    Err(e) => {
+                        // Skip — binding couldn't be computed
+                        // this pass (likely references a
+                        // not-yet-computed binding). Discard any
+                        // deferred error the failed eval left
+                        // behind (cranelift `ctx.error`) so it
+                        // does not leak into the next pass.
+                        //
+                        // A multi-shot `Suspended` is control
+                        // flow, not a fixpoint skip: unwind to the
+                        // journal driver instead of retrying (the
+                        // pass could otherwise complete and drop
+                        // the suspension, ADR-0158).
+                        if e.suspension_id().is_some() {
+                            return Err(e);
                         }
-                        continue;
+                        ctx.clear_eval_error();
                     }
                 }
+                continue;
             }
 
             // Non-binding expression — evaluate normally.
@@ -3633,12 +3606,12 @@ pub fn covering_frame_acc(stack: &[TaggedValue], op: &str) -> Option<TaggedValue
 pub fn covering_frame_set_acc(stack: &mut [TaggedValue], op: &str, s: TaggedValue) {
     for h in stack.iter_mut().rev() {
         if handler_impl(h, op).is_some() {
-            if let TaggedValue::Obj(map) = h {
-                if map.get(HANDLER_ACC_KEY).is_some() {
-                    let mut m = (**map).clone();
-                    m.insert(Rc::from(HANDLER_ACC_KEY), s);
-                    *h = TaggedValue::Obj(Rc::new(m));
-                }
+            if let TaggedValue::Obj(map) = h
+                && map.get(HANDLER_ACC_KEY).is_some()
+            {
+                let mut m = (**map).clone();
+                m.insert(Rc::from(HANDLER_ACC_KEY), s);
+                *h = TaggedValue::Obj(Rc::new(m));
             }
             return;
         }
@@ -3649,12 +3622,13 @@ pub fn covering_frame_set_acc(stack: &mut [TaggedValue], op: &str, s: TaggedValu
 /// canonical `Pair` (`***`/`product` values) or a two-element array
 /// (`[result, s']` — the surface spelling, since `(a, b)` is not a pair
 /// literal). Anything else is a contract violation.
-pub fn acc_result_split(out: TaggedValue, op: &str) -> Result<(TaggedValue, TaggedValue), LangError> {
+pub fn acc_result_split(
+    out: TaggedValue,
+    op: &str,
+) -> Result<(TaggedValue, TaggedValue), LangError> {
     match out {
         TaggedValue::Pair(p) => Ok((p.0.clone(), p.1.clone())),
-        TaggedValue::Arr(xs) if xs.len() == 2 => {
-            Ok((xs[0].clone(), xs[1].clone()))
-        }
+        TaggedValue::Arr(xs) if xs.len() == 2 => Ok((xs[0].clone(), xs[1].clone())),
         other => Err(LangError::engine(format!(
             "perform: acc impl for op '{op}' must return (result, state') — \
              a pair or 2-element array, got {}",
@@ -3786,6 +3760,107 @@ pub fn mint_resume_value(id: u64) -> TaggedValue {
     TaggedValue::Obj(Rc::new(m))
 }
 
+/// An engine-neutral `resume` driver: applied to the `resume` argument,
+/// it re-runs the suspending engine's computation and returns its result.
+pub type ResumptionDriver = Rc<dyn Fn(TaggedValue) -> Result<TaggedValue, LangError>>;
+
+thread_local! {
+    /// Engine-neutral `resume` drivers, keyed by globally unique
+    /// suspension id (see [`register_resumption_driver`]).
+    static RESUMPTION_DRIVERS: std::cell::RefCell<FxHashMap<u64, ResumptionDriver>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// Register an engine-neutral `resume` driver for `id`.
+///
+/// The replay model mints `{"__resume__": <id>}` values whose ids name
+/// the *minting* engine's suspension table, and the normal path is that
+/// engine resolving the id itself. That breaks when a clause body runs
+/// on a **different** engine than the one that suspended: the cranelift
+/// backend applies arrow values through the tree-walk interpreter
+/// (`apply_value_treewalk`), so `resume` inside a clause is applied by
+/// the tree-walk's `apply_app`, which cannot see cranelift's table. The
+/// suspending engine installs a driver here; every engine's `__resume__`
+/// application seam consults this shared table
+/// ([`drive_shared_resumption`]) before its own table.
+pub fn register_resumption_driver(id: u64, driver: ResumptionDriver) {
+    RESUMPTION_DRIVERS.with(|d| d.borrow_mut().insert(id, driver));
+}
+
+/// Drive the shared `resume` driver registered for `id`, if any.
+///
+/// `None` means `id` is unknown to the shared table — the caller should
+/// fall back to its own suspension table (the id names a journal of the
+/// engine that is running).
+pub fn drive_shared_resumption(id: u64, x: TaggedValue) -> Option<Result<TaggedValue, LangError>> {
+    let driver = RESUMPTION_DRIVERS.with(|d| d.borrow().get(&id).cloned())?;
+    Some(driver(x))
+}
+
+/// How many shared `resume` drivers are registered on this thread.
+///
+/// The table is cleared at the outermost eval boundary
+/// ([`ResumeTableScope`]); this accessor exists so engines can assert that
+/// finalization actually happened (and for diagnostics).
+pub fn resumption_driver_count() -> usize {
+    RESUMPTION_DRIVERS.with(|d| d.borrow().len())
+}
+
+thread_local! {
+    /// Engine evaluations in progress on this thread (see
+    /// [`ResumeTableScope`]).
+    static EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard marking one engine evaluation on this thread — the
+/// finalization pass for the multi-shot `resume` tables.
+///
+/// Suspension bookkeeping is retained after its `handle` returns (that is
+/// what makes an escaped `resume` callable), so nothing reclaims it while
+/// the eval runs. This guard closes the leak at the eval boundary: the
+/// outermost evaluation (success or error) clears the shared driver table
+/// and runs the engine-supplied cleanup. Nested evaluations — a host
+/// callback re-entering an engine, a `.hnl` module function evaluating
+/// another — only bump the depth, so an in-flight journal is never
+/// collected out from under an outer run.
+pub struct ResumeTableScope {
+    /// Engine cleanup, held only by the outermost evaluation.
+    on_outermost_exit: Option<Box<dyn FnOnce()>>,
+}
+
+impl ResumeTableScope {
+    /// Enter one evaluation. `on_outermost_exit` runs once, when the
+    /// outermost evaluation on this thread finishes; engines use it to
+    /// clear their own journal/suspension tables.
+    pub fn enter(on_outermost_exit: impl FnOnce() + 'static) -> Self {
+        let depth = EVAL_DEPTH.with(|d| {
+            let n = d.get() + 1;
+            d.set(n);
+            n
+        });
+        Self {
+            on_outermost_exit: (depth == 1)
+                .then(|| Box::new(on_outermost_exit) as Box<dyn FnOnce()>),
+        }
+    }
+}
+
+impl Drop for ResumeTableScope {
+    fn drop(&mut self) {
+        let depth = EVAL_DEPTH.with(|d| {
+            let n = d.get().saturating_sub(1);
+            d.set(n);
+            n
+        });
+        if depth == 0 {
+            RESUMPTION_DRIVERS.with(|d| d.borrow_mut().clear());
+            if let Some(cleanup) = self.on_outermost_exit.take() {
+                cleanup();
+            }
+        }
+    }
+}
+
 /// `IO(sig)` effect interpretation (ADR-0153 §4) — the shared port of
 /// the tree-walk `Handle` arm's `interpret_io_former`: an `IO` former
 /// object `{"__former__": <type.io sym>, "indices": [sig]}` produced
@@ -3857,16 +3932,14 @@ fn handle_dyn_shell(ctx: &mut dyn NativeOpCtx) -> OpResult {
         .and_then(|c| c.as_array())
         .cloned()
         .ok_or_else(|| LangError::engine("handle_dyn: missing children in payload".to_string()))?;
-    let child_at = |ctx: &mut dyn NativeOpCtx,
-                    role: &str,
-                    fallback: usize|
-     -> Result<usize, LangError> {
-        ctx.child_role_index_for(role)
-            .and_then(|pos| children.get(pos).and_then(Value::as_u64))
-            .or_else(|| children.get(fallback).and_then(Value::as_u64))
-            .map(|i| i as usize)
-            .ok_or_else(|| LangError::engine(format!("handle_dyn: missing {role} child")))
-    };
+    let child_at =
+        |ctx: &mut dyn NativeOpCtx, role: &str, fallback: usize| -> Result<usize, LangError> {
+            ctx.child_role_index_for(role)
+                .and_then(|pos| children.get(pos).and_then(Value::as_u64))
+                .or_else(|| children.get(fallback).and_then(Value::as_u64))
+                .map(|i| i as usize)
+                .ok_or_else(|| LangError::engine(format!("handle_dyn: missing {role} child")))
+        };
     let target_idx = child_at(ctx, "target", 0)?;
     let impl_idx = child_at(ctx, "impl", 1)?;
     let handler = ctx.eval_node(AstRef::new(impl_idx))?;
@@ -3889,11 +3962,7 @@ fn handle_dyn_shell(ctx: &mut dyn NativeOpCtx) -> OpResult {
     // [`NativeOpCtx::run_delimited`] hook (it owns the matching pop on
     // every exit). The default reproduces the previous inline tail;
     // multi-shot `resume` engines override it to drive suspensions.
-    let val = ctx.run_delimited(
-        AstRef::new(target_idx),
-        &handler,
-        &frame_handler,
-    )?;
+    let val = ctx.run_delimited(AstRef::new(target_idx), &handler, &frame_handler)?;
     Ok((val, false))
 }
 
@@ -4041,45 +4110,44 @@ pub fn step_decision(
 /// - Multi-param arrow over an object state: `[field_by_param_name, ...]`
 ///   — each param destructures the same-named field.
 pub fn build_loop_step_args(closure_val: &TaggedValue, current: &TaggedValue) -> Vec<TaggedValue> {
-    if let Some(obj_state) = current.as_object() {
-        if let TaggedValue::Arrow {
+    if let Some(obj_state) = current.as_object()
+        && let TaggedValue::Arrow {
             params,
             array_pattern,
             ..
         } = closure_val
-        {
-            if *array_pattern {
-                if params.len() == 1 {
-                    // Single-param array-pattern arrow: pass the state
-                    // directly as the sole array element.
-                    return vec![TaggedValue::Arr(Rc::from([current.clone()]))];
-                }
-                // Multi-param array-pattern: destructure the object state
-                // by param name and pack into one array.
-                let arr: Vec<TaggedValue> = params
-                    .iter()
-                    .map(|p| {
-                        obj_state
-                            .get(p.as_str())
-                            .cloned()
-                            .unwrap_or(TaggedValue::Null)
-                    })
-                    .collect();
-                return vec![TaggedValue::Arr(Rc::from(arr))];
+    {
+        if *array_pattern {
+            if params.len() == 1 {
+                // Single-param array-pattern arrow: pass the state
+                // directly as the sole array element.
+                return vec![TaggedValue::Arr(Rc::from([current.clone()]))];
             }
-            if params.len() > 1 {
-                // Destructure: bind each param to the corresponding field
-                // by name.
-                return params
-                    .iter()
-                    .map(|p| {
-                        obj_state
-                            .get(p.as_str())
-                            .cloned()
-                            .unwrap_or(TaggedValue::Null)
-                    })
-                    .collect();
-            }
+            // Multi-param array-pattern: destructure the object state
+            // by param name and pack into one array.
+            let arr: Vec<TaggedValue> = params
+                .iter()
+                .map(|p| {
+                    obj_state
+                        .get(p.as_str())
+                        .cloned()
+                        .unwrap_or(TaggedValue::Null)
+                })
+                .collect();
+            return vec![TaggedValue::Arr(Rc::from(arr))];
+        }
+        if params.len() > 1 {
+            // Destructure: bind each param to the corresponding field
+            // by name.
+            return params
+                .iter()
+                .map(|p| {
+                    obj_state
+                        .get(p.as_str())
+                        .cloned()
+                        .unwrap_or(TaggedValue::Null)
+                })
+                .collect();
         }
     }
     vec![current.clone()]

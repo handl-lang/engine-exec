@@ -136,6 +136,7 @@ impl Module for IoModule {
 mod tests {
     use super::*;
 
+    #[allow(clippy::result_large_err)]
     fn call(module: &IoModule, name: &str, args: &[Value]) -> Result<Value, EvalError> {
         module
             .function(name)
@@ -189,8 +190,6 @@ mod tests {
         assert!(call(&m, "perform", &[json!(7), json!("x")]).is_err());
         assert!(call(&m, "perform", &[json!({}), json!("x")]).is_err());
         assert!(call(&m, "perform", &[]).is_err());
-        assert!(
-            call(&m, "perform", &[json!("a"), json!(1), json!(2)]).is_err()
-        );
+        assert!(call(&m, "perform", &[json!("a"), json!(1), json!(2)]).is_err());
     }
 }
