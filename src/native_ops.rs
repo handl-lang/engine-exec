@@ -2376,10 +2376,12 @@ pub fn apply_native_op(
                         .filter(|n| *n >= 0.0 && n.fract() == 0.0)
                         .map(|n| n as usize)
                         .ok_or_else(|| {
-                            LangError::engine(
-                                "field_access: array index must be a non-negative integer"
-                                    .to_string(),
-                            )
+                            LangError::engine(format!(
+                                "field_access: array index must be a non-negative integer (array of len {}, field {} {:?})",
+                                arr.len(),
+                                type_tag(&field),
+                                field
+                            ))
                         })?;
                     arr.get(i).cloned().map(|v| (v, false)).ok_or_else(|| {
                         LangError::engine(format!(
