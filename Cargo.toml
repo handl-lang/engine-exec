@@ -12,6 +12,7 @@ handl-platform = { git = "https://github.com/handl-lang/host", branch = "main" }
 handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
 serde_json = "1"
 rustc-hash = "2"
+stacker = "0.1"
 
 [dev-dependencies]
 handl-plugin-module = { git = "https://github.com/handl-lang/host", branch = "main" }
