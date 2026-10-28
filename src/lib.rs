@@ -20,6 +20,9 @@
 pub mod io;
 pub mod native_ops;
 pub mod pattern_match;
+pub mod services;
+
+pub use services::EvalFrame;
 
 use std::rc::Rc;
 
