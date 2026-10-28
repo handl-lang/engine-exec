@@ -3,7 +3,7 @@
 //!
 //! `perform` is the op-emission primitive: `perform(op, arg)` mints the
 //! `IO` former object `{"__former__": <type.io sym>, "indices":
-//! [{op: arg}]}` — exactly the shape [`native_ops::interpret_io_former`]
+//! [{op: arg}]}` — exactly the shape [`crate::native_ops::interpret_io_former`]
 //! dispatches under `handle <body> with <handler>`: each sig entry's op
 //! name routes to the handler's matching impl with the sig entry's value
 //! as the operand, and the entry is replaced by the impl's result.

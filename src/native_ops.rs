@@ -542,7 +542,7 @@ pub trait NativeOpCtx {
     }
 
     /// Mark `names` as bound by the `eval_rec` region about to run; every
-    /// [`rec_region_enter`] must be matched by a [`rec_region_exit`]
+    /// `rec_region_enter` must be matched by a `rec_region_exit`
     /// before the region's scope pops.
     fn rec_region_enter(&mut self, _names: &[Rc<str>]) {}
     /// Pop the innermost rec-region name set.

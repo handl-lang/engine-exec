@@ -138,7 +138,7 @@ pub trait EvalEngine {
     /// Like [`eval_shared`](Self::eval_shared), but binds `args` directly
     /// into the call frame's scope rather than via per-call
     /// [`with_global`](Self::with_global) engine cloning, eliminating the N
-    /// engine clones that [`Runtime::eval_shared_with_globals`] would incur
+    /// engine clones that `Runtime::eval_shared_with_globals` would incur
     /// for N arguments.
     ///
     /// The argument names are determined by the caller (typically
@@ -149,9 +149,9 @@ pub trait EvalEngine {
     /// [`with_global`](Self::with_global), then delegate to
     /// [`eval_shared`](Self::eval_shared). Engines that can bind per-call
     /// names directly on the call frame (e.g. the tree-walk engine's
-    /// [`ScopeStack`](hnl_engine_exec_tree_walk::ScopeStack)) override
-    /// this for a zero-clone path. The default preserves the existing
-    /// fallback behavior for engines that do not override it.
+    /// `ScopeStack`) override this for a zero-clone path. The default
+    /// preserves the existing fallback behavior for engines that do not
+    /// override it.
     ///
     /// # Errors
     ///
