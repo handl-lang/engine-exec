@@ -1,14 +1,19 @@
 # engine-exec
 
-`hnl-engine-exec` — The **abstraction** crate for the eval operation (ADR-0044 §3, §4, §7).
+`hnl-engine-exec` — the abstraction crate for the eval operation.
+
+An `engine-*` crate: the trait/type surface for evaluation that concrete
+engines (`engine-exec-tree-walk`, `engine-exec-bytecode`,
+`engine-exec-cranelift`) implement.
 
 ## Development
 
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo xtask gate        # fmt --check → clippy -D warnings → test → doc
 ```
 
-`ci.sh` is the gate (fmt → clippy → test → doc). Deps resolve from git, so no
+`cargo xtask` wraps the repo's `xtask/` crate (`fmt`, `clippy`, `test`, `doc`,
+`check`, `gate`); `ci.sh` is the gate entry. Deps resolve from git, so no
 sibling checkouts are needed; a plain clone test-runs as-is.
 
 ## License
@@ -17,10 +22,4 @@ MIT.
 
 ## Documentation
 
-Published site (Diátaxis): <https://handl-lang.github.io/docs/engine-exec/>
-
-- [Reference](https://handl-lang.github.io/docs/engine-exec/reference/) — public API surface
-- [How-to](https://handl-lang.github.io/docs/engine-exec/how-to/) — task recipes
-- [Explanation](https://handl-lang.github.io/docs/engine-exec/explanation/) — design and rationale
-
-Decision records live on the `project` branch under `project/adrs/`.
+<https://handl-lang.github.io/docs/engine-exec/>
