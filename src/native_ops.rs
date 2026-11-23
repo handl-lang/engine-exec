@@ -1269,12 +1269,17 @@ pub fn apply_native_op(
                 }
             }
             let body_def = ctx.closure_body_def(AstRef::new(body), &subst)?;
+            let body_def_rc = Rc::new(body_def);
+            // Coverage (opt-in): record which source this arrow's body
+            // arena spans index into, so `apply_arrow_body` can attribute
+            // hits even when the arrow runs under another module's eval.
+            crate::coverage::CoverageSession::note_arrow_body(Rc::as_ptr(&body_def_rc) as usize);
             Ok((
                 TaggedValue::Arrow {
                     params: Rc::from(params),
                     rest: rest.map(Rc::from),
                     array_pattern,
-                    body_def: Rc::new(body_def),
+                    body_def: body_def_rc,
                     binds: Rc::new(binds),
                     handlers: Rc::from(Vec::new()),
                 },
