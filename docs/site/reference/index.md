@@ -15,7 +15,7 @@
 
 | crate | role |
 |---|---|
-| `hnl-engine-exec` | abstraction — contract only |
+| `hnl-exec` | abstraction — contract only |
 
 ## Build and test
 

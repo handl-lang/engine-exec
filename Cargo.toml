@@ -1,16 +1,16 @@
 [package]
-name = "hnl-engine-exec"
+name = "hnl-exec"
 version = "0.1.0"
 edition = "2024"
 description = "The abstraction crate for the eval operation (ADR-0044 §3, §4, §7)."
 license = "MIT"
-repository = "https://github.com/handl-lang/engine-exec"
-homepage = "https://handl-lang.github.io/docs/engine-exec/"
-documentation = "https://handl-lang.github.io/docs/engine-exec/reference/"
+repository = "https://github.com/handl-lang/exec"
+homepage = "https://handl-lang.github.io/docs/exec/"
+documentation = "https://handl-lang.github.io/docs/exec/reference/"
 readme = "README.md"
 keywords = ["handl", "engine", "eval", "interpreter", "language-as-data"]
 categories = ["development-tools", "compilers"]
-# Git-install only: https://github.com/handl-lang/engine-exec (no crates.io).
+# Git-install only: https://github.com/handl-lang/exec (no crates.io).
 publish = false
 
 [dependencies]

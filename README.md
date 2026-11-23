@@ -1,10 +1,10 @@
-# engine-exec
+# exec
 
-`hnl-engine-exec` — the abstraction crate for the eval operation.
+`hnl-exec` — the abstraction crate for the eval operation.
 
 An `engine-*` crate: the trait/type surface for evaluation that concrete
-engines (`engine-exec-tree-walk`, `engine-exec-bytecode`,
-`engine-exec-cranelift`) implement.
+engines (`exec-tree-walk`, `exec-bytecode`,
+`exec-cranelift`) implement.
 
 ## Development
 
@@ -22,4 +22,4 @@ MIT.
 
 ## Documentation
 
-<https://handl-lang.github.io/docs/engine-exec/>
+<https://handl-lang.github.io/docs/exec/>

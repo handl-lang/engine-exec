@@ -1,9 +1,9 @@
-//! # hnl-engine-exec
+//! # hnl-exec
 //!
 //! The **abstraction** crate for the eval operation (ADR-0044 §3, §4, §7).
 //!
 //! Splits `plugin-ext-eval` into an abstraction (operation marker + trait,
-//! no engine) and an engine crate (`hnl-engine-exec-tree-walk`). This
+//! no engine) and an engine crate (`hnl-exec-tree-walk`). This
 //! crate defines the `Eval` operation marker, [`EvalRequest`], the
 //! [`EvalEngine`] trait. `Foreign` scheme dispatch uses
 //! [`handl_platform::ModuleLookup`]/[`handl_platform::Function`] from the
@@ -32,7 +32,7 @@ use std::rc::Rc;
 /// natively-recursive helpers ([`pattern_match::try_pattern`],
 /// `nat_ctor_depth`) so deep values/patterns are bounded by total
 /// growable stack, not the platform stack. Mirrors
-/// `hnl-engine-typecheck-nbe`.
+/// `hnl-tool-typecheck-nbe`.
 pub(crate) const STACK_RED_ZONE: usize = 4 * 1024 * 1024;
 
 /// Fresh stack segment allocated by [`stacker::maybe_grow`] on overflow

@@ -1,4 +1,4 @@
-# engine-exec
+# exec
 
 The eval-operation contract: `Eval`, `EvalRequest`, `EvalEngine`.
 
@@ -7,8 +7,8 @@ The eval-operation contract: `Eval`, `EvalRequest`, `EvalEngine`.
 The **abstraction crate** for the eval operation (ADR-0044 §3, §4, §7):
 the `Eval` operation marker, the `EvalRequest` an engine receives, and the
 `EvalEngine` trait it implements. **No interpreter lives here.** The concrete
-engines are `engine-exec-tree-walk` (reference interpreter) and
-`engine-exec-bytecode` (stack VM), which must agree value-for-value.
+engines are `exec-tree-walk` (reference interpreter) and
+`exec-bytecode` (stack VM), which must agree value-for-value.
 
 ## Modules
 - `io` — the `IO` effect surface: handler frames, resume, accumulation
@@ -18,9 +18,9 @@ engines are `engine-exec-tree-walk` (reference interpreter) and
 
 ## Start here
 
-- **Reference** — [public API](/engine-exec/reference/)
-- **How-to** — [task recipes](/engine-exec/how-to/)
-- **Explanation** — [design and rationale](/engine-exec/explanation/)
+- **Reference** — [public API](/exec/reference/)
+- **How-to** — [task recipes](/exec/how-to/)
+- **Explanation** — [design and rationale](/exec/explanation/)
 
 No tutorials: this repo is a building block used from Rust. End-to-end
 walkthroughs live with the product that composes it — see the
