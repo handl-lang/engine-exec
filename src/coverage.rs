@@ -22,17 +22,22 @@
 //!   op). This keeps hits attributed correctly when an arrow minted in
 //!   module A runs while module B's eval is active.
 //!
-//! # Coordinate space (honest gap)
+//! # Coordinate space
 //!
 //! Spans index the *prepared* source text — the exact string that was
 //! lexed — which for canonical `.hnl` modules is the output of
 //! `handl_runtime::module_prep::prepare_module` (and, for
 //! `plugin-lib-handl`, the `analyze_source` transform plus a `(`…`)`
 //! wrapper), **not** the file on disk. Both transforms re-serialize the
-//! source, so byte offsets do not map faithfully back to file lines.
-//! [`CoverageSource::text`] therefore stores the prepared text and all
-//! reported line numbers are **prepared-source coordinates**, labeled as
-//! such in reports. `origin` carries the on-disk path for reference.
+//! source.
+//!
+//! Producers that re-serialize can attach a provenance map —
+//! [`CoverageSource::line_map`], one entry per prepared line giving the
+//! 1-based origin-file line (`None` for generated lines) — built with
+//! [`OriginLineMap`]. When present, [`CoverageReport`] resolves hits to
+//! file lines (`fileLineHits` in JSON, `file_line` on declarations) in
+//! addition to the prepared coordinates, which remain the canonical
+//! span space. `origin` carries the on-disk path for reference.
 //!
 //! # Threading
 //!
@@ -85,6 +90,15 @@ pub struct CoverageSource {
     /// Free-form coordinate-space label, e.g. `"prepared"` — surfaced in
     /// reports so consumers know line numbers are not file lines.
     pub coordinate_space: String,
+    /// Prepared-line → origin-file-line provenance (1-based lines on
+    /// both sides; `None` entries are generated lines with no file
+    /// origin). Index `i` describes prepared line `i + 1`; lines past
+    /// the map's end are unmapped. `None` when the producer cannot
+    /// prove provenance.
+    pub line_map: Option<Vec<Option<u32>>>,
+    /// Total lines in the origin file, when known — the denominator for
+    /// file-line coverage views.
+    pub origin_lines: Option<u32>,
 }
 
 impl CoverageSource {
@@ -98,6 +112,8 @@ impl CoverageSource {
             text,
             origin: None,
             coordinate_space: "prepared".to_string(),
+            line_map: None,
+            origin_lines: None,
         }
     }
 
@@ -105,6 +121,97 @@ impl CoverageSource {
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
         self
+    }
+
+    /// Attach a prepared-line → origin-file-line map (see
+    /// [`OriginLineMap`]) plus the origin file's total line count.
+    pub fn with_file_lines(
+        mut self,
+        line_map: Vec<Option<u32>>,
+        origin_lines: Option<u32>,
+    ) -> Self {
+        self.line_map = Some(line_map);
+        self.origin_lines = origin_lines;
+        self
+    }
+}
+
+/// Builder for a [`CoverageSource::line_map`]: records, for every
+/// prepared-source line *started*, the 1-based origin-file line it
+/// derives from (`None` for generated/synthetic lines).
+///
+/// Producers append output text piecewise — [`push`](Self::push) takes
+/// the origin line of the piece's *first* line and assumes the piece's
+/// interior lines are contiguous in the origin (true for verbatim
+/// slices); [`push_lines`](Self::push_lines) takes an explicit per-line
+/// origin slice for re-ordered content (e.g. a hoisted preamble). Line
+/// boundaries are `\n`; a piece may start mid-line (it then continues
+/// the previous prepared line and contributes no map entry until its
+/// first interior newline).
+#[derive(Debug, Clone, Default)]
+pub struct OriginLineMap {
+    /// One entry per prepared line started so far.
+    lines: Vec<Option<u32>>,
+    /// Whether the next emitted char starts a new prepared line.
+    at_line_start: bool,
+}
+
+impl OriginLineMap {
+    /// An empty map — the first pushed char starts prepared line 1.
+    pub fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            at_line_start: true,
+        }
+    }
+
+    /// Append `text`; `first` is the 1-based origin line of `text`'s
+    /// first line (`None` = generated). `text`'s k-th interior line
+    /// (0-based, split on `\n`) maps to `first + k`.
+    pub fn push(&mut self, text: &str, first: Option<u32>) {
+        let mut line = first;
+        for ch in text.chars() {
+            if self.at_line_start {
+                self.lines.push(line);
+                self.at_line_start = false;
+            }
+            if ch == '\n' {
+                self.at_line_start = true;
+                line = line.map(|l| l.saturating_add(1));
+            }
+        }
+    }
+
+    /// Append `text` whose per-line origins are given explicitly:
+    /// `origins[i]` is the origin of `text`'s i-th line (0-based, split
+    /// on `\n`); missing entries map to `None`.
+    pub fn push_lines(&mut self, text: &str, origins: &[Option<u32>]) {
+        let mut idx = 0usize;
+        for ch in text.chars() {
+            if self.at_line_start {
+                self.lines.push(origins.get(idx).copied().flatten());
+                self.at_line_start = false;
+            }
+            if ch == '\n' {
+                self.at_line_start = true;
+                idx += 1;
+            }
+        }
+    }
+
+    /// The recorded map: index `i` → origin of prepared line `i + 1`.
+    pub fn into_vec(self) -> Vec<Option<u32>> {
+        self.lines
+    }
+
+    /// Number of prepared lines started so far.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether no prepared line has been started yet.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
     }
 }
 
@@ -383,28 +490,62 @@ impl CoverageSession {
             sources: shared
                 .sources
                 .iter()
-                .map(|s| SourceReport {
-                    name: s.spec.name.clone(),
-                    origin: s.spec.origin.clone(),
-                    coordinate_space: s.spec.coordinate_space.clone(),
-                    total_lines: s.spec.text.lines().filter(|l| !l.trim().is_empty()).count()
-                        as u64,
-                    line_hits: s.line_hits.iter().map(|(&l, &n)| (l, n)).collect(),
-                    decls: s
-                        .spec
-                        .decls
-                        .iter()
-                        .zip(s.decl_hits.iter())
-                        .map(|(d, h)| DeclReport {
-                            name: d.name.clone(),
-                            start: d.start,
-                            end: d.end,
-                            is_arrow: d.is_arrow,
-                            any_hits: h.any,
-                            body_hits: h.body,
-                        })
-                        .collect(),
-                    applications: s.applications,
+                .map(|s| {
+                    // Resolve prepared-line hits to origin-file lines
+                    // when the source carries a provenance map. Several
+                    // prepared lines can map to the same file line
+                    // (e.g. a `name :=` wrapper sharing the decl line);
+                    // counts merge.
+                    let file_line_hits = s.spec.line_map.as_ref().map(|map| {
+                        let mut acc: std::collections::BTreeMap<u32, u64> =
+                            std::collections::BTreeMap::new();
+                        for (&prepared, &n) in &s.line_hits {
+                            if let Some(Some(orig)) =
+                                map.get(prepared.saturating_sub(1) as usize)
+                            {
+                                *acc.entry(*orig).or_insert(0) += n;
+                            }
+                        }
+                        acc.into_iter().collect()
+                    });
+                    SourceReport {
+                        name: s.spec.name.clone(),
+                        origin: s.spec.origin.clone(),
+                        coordinate_space: s.spec.coordinate_space.clone(),
+                        line_map: s.spec.line_map.clone(),
+                        origin_lines: s.spec.origin_lines,
+                        file_line_hits,
+                        total_lines: s.spec.text.lines().filter(|l| !l.trim().is_empty()).count()
+                            as u64,
+                        line_hits: s.line_hits.iter().map(|(&l, &n)| (l, n)).collect(),
+                        decls: s
+                            .spec
+                            .decls
+                            .iter()
+                            .zip(s.decl_hits.iter())
+                            .map(|(d, h)| {
+                                // The declaration's origin-file line:
+                                // prepared line of `d.start` through the
+                                // source's provenance map.
+                                let file_line = s.spec.line_map.as_ref().and_then(|map| {
+                                    let pl = s.line_of(d.start);
+                                    map.get(pl.saturating_sub(1) as usize)
+                                        .copied()
+                                        .flatten()
+                                });
+                                DeclReport {
+                                    name: d.name.clone(),
+                                    start: d.start,
+                                    end: d.end,
+                                    is_arrow: d.is_arrow,
+                                    any_hits: h.any,
+                                    body_hits: h.body,
+                                    file_line,
+                                }
+                            })
+                            .collect(),
+                        applications: s.applications,
+                    }
                 })
                 .collect(),
         }
@@ -934,6 +1075,9 @@ pub struct DeclReport {
     pub any_hits: u64,
     /// Hits recorded inside arrow bodies.
     pub body_hits: u64,
+    /// Origin-file line of the declaration's start, when the source
+    /// carries a provenance map and the decl line is mapped.
+    pub file_line: Option<u32>,
 }
 
 impl DeclReport {
@@ -957,6 +1101,14 @@ pub struct SourceReport {
     pub origin: Option<String>,
     /// Coordinate-space label (`"prepared"`).
     pub coordinate_space: String,
+    /// Prepared-line → origin-file-line map, when the producer attached
+    /// one ([`CoverageSource::line_map`]).
+    pub line_map: Option<Vec<Option<u32>>>,
+    /// Total lines in the origin file, when known.
+    pub origin_lines: Option<u32>,
+    /// (origin-file line, hit count) pairs resolved through `line_map`,
+    /// sorted by file line. `None` when no map is attached.
+    pub file_line_hits: Option<Vec<(u32, u64)>>,
     /// Non-blank lines in the prepared text (coverage denominator).
     pub total_lines: u64,
     /// (1-based prepared line, hit count) pairs, hit lines only.
@@ -994,10 +1146,23 @@ impl CoverageReport {
                     .iter()
                     .map(|(l, n)| (l.to_string(), serde_json::json!(n)))
                     .collect();
+                let file_hits = s.file_line_hits.as_ref().map(|hits| {
+                    hits.iter()
+                        .map(|(l, n)| (l.to_string(), serde_json::json!(n)))
+                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                });
                 serde_json::json!({
                     "name": s.name,
                     "origin": s.origin,
                     "coordinateSpace": s.coordinate_space,
+                    // Provenance: prepared line (1-based, index+1) →
+                    // origin file line, `null` for generated lines.
+                    "lineMap": s.line_map,
+                    "originLines": s.origin_lines,
+                    // Hits resolved to origin-file lines through
+                    // `lineMap` (merged when several prepared lines
+                    // share a file line); `null` when unmapped.
+                    "fileLineHits": file_hits,
                     "totalLines": s.total_lines,
                     "linesCovered": s.lines_covered(),
                     "lineHits": hits,
@@ -1010,6 +1175,7 @@ impl CoverageReport {
                         "anyHits": d.any_hits,
                         "bodyHits": d.body_hits,
                         "covered": d.covered(),
+                        "fileLine": d.file_line,
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -1023,12 +1189,26 @@ impl CoverageReport {
             .flat_map(|s| s.decls.iter())
             .filter(|d| d.covered())
             .count() as u64;
+        // File-line totals only when at least one source resolved
+        // provenance — otherwise the keys are omitted (null).
+        let file_lines_covered: Option<u64> = self
+            .sources
+            .iter()
+            .any(|s| s.file_line_hits.is_some())
+            .then(|| {
+                self.sources
+                    .iter()
+                    .filter_map(|s| s.file_line_hits.as_ref())
+                    .map(|hits| hits.len() as u64)
+                    .sum()
+            });
         serde_json::json!({
-            "coordinateSpace": "prepared-source (spans index the post-module-prep text, not the file on disk)",
+            "coordinateSpace": "prepared-source (spans index the post-module-prep text, not the file on disk); per-source lineMap/fileLineHits resolve to origin-file lines when the producer attached provenance",
             "totals": {
                 "sources": self.sources.len(),
                 "linesTotal": total_lines,
                 "linesCovered": lines_covered,
+                "fileLinesCovered": file_lines_covered,
                 "declarationsTotal": decls_total,
                 "declarationsCovered": decls_covered,
             },
@@ -1109,5 +1289,77 @@ mod tests {
         assert!(CoverageSession::push_source(0).is_none());
         CoverageSession::note_arrow_body(0xdead);
         assert!(CoverageSession::source_for_body(0xdead).is_none());
+    }
+
+    #[test]
+    fn origin_line_map_tracks_pieces() {
+        let mut m = OriginLineMap::new();
+        // Generated wrapper line, then a two-line verbatim piece from
+        // file line 10, then a generated binding on file line 20.
+        m.push("do {\n", None);
+        m.push("f := 1;\n", Some(10));
+        m.push("g :=\n  2;\n", Some(20));
+        m.push("}\n", None);
+        assert_eq!(
+            m.into_vec(),
+            vec![
+                None,        // `do {`
+                Some(10),    // `f := 1;`
+                Some(20),    // `g :=`
+                Some(21),    // `  2;` — contiguous interior line
+                None,        // `}`
+            ]
+        );
+    }
+
+    #[test]
+    fn origin_line_map_mid_line_and_explicit_lines() {
+        let mut m = OriginLineMap::new();
+        m.push("a := 1; ", Some(3)); // starts line 1, no newline yet
+        m.push("b := 2;\n", Some(7)); // continues line 1 — no entry
+        // `b := 2;` shares prepared line 1; the \n ends it.
+        m.push_lines("x\ny\n", &[Some(4), None]);
+        assert_eq!(
+            m.into_vec(),
+            vec![Some(3), Some(4), None]
+        );
+    }
+
+    #[test]
+    fn report_resolves_file_line_hits() {
+        let session = CoverageSession::new();
+        session.install_local();
+        // Prepared text: line 1 generated, lines 2-3 map to file 10-11.
+        let src = "do {\nf := 1\ng := 2\n}"
+            .to_string();
+        let mut map = OriginLineMap::new();
+        map.push("do {\n", None);
+        map.push("f := 1\n", Some(10));
+        map.push("g := 2\n", Some(11));
+        map.push("}", None);
+        let spec = CoverageSource::new("mod.hnl", src)
+            .with_origin("mod.hnl")
+            .with_file_lines(map.into_vec(), Some(20));
+        let id = CoverageSession::register(spec).expect("registered");
+        {
+            let _g = CoverageSession::push_source(id).expect("guard");
+            // Hit on prepared line 2 (`f := 1`) → file line 10.
+            record_node_span(Some((5, 6)));
+        }
+        let report = session.report();
+        let s = &report.sources[0];
+        assert_eq!(
+            s.file_line_hits.as_deref(),
+            Some(&[(10u32, 1u64)][..]),
+            "{s:?}"
+        );
+        assert_eq!(s.origin_lines, Some(20));
+        assert_eq!(s.line_map.as_ref().unwrap()[1], Some(10));
+        // JSON exposes the resolved hits + per-decl file lines.
+        let json = report.to_json();
+        assert_eq!(json["sources"][0]["fileLineHits"]["10"], 1);
+        assert_eq!(json["sources"][0]["lineMap"][1], 10);
+        assert_eq!(json["sources"][0]["originLines"], 20);
+        CoverageSession::uninstall_local();
     }
 }
