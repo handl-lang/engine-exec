@@ -1282,6 +1282,7 @@ pub fn apply_native_op(
                     body_def: body_def_rc,
                     binds: Rc::new(binds),
                     handlers: Rc::from(Vec::new()),
+                    sig: None,
                 },
                 false,
             ))
@@ -2419,6 +2420,7 @@ pub fn apply_native_op(
                         body_def,
                         binds,
                         handlers,
+                        sig,
                     },
                     TaggedValue::Str(key),
                 ) => match key.as_ref() {
@@ -2438,6 +2440,14 @@ pub fn apply_native_op(
                     "binds" => Ok((TaggedValue::Obj(binds), false)),
                     "handlers" => Ok((TaggedValue::Arr(handlers), false)),
                     "array_pattern" => Ok((TaggedValue::Bool(array_pattern), false)),
+                    // P-013 T-148: the atom's declared signature, when the
+                    // arrow carries one (host atoms); `null` otherwise.
+                    "sig" => Ok((
+                        sig.as_ref()
+                            .map(|s| s.as_ref().clone())
+                            .unwrap_or(TaggedValue::Null),
+                        false,
+                    )),
                     _ => Ok((TaggedValue::Null, false)),
                 },
                 (TaggedValue::Str(s), TaggedValue::Str(key)) => {
@@ -3526,6 +3536,7 @@ pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> Tagged
             body_def,
             binds,
             handlers,
+            sig,
         } => {
             let mut hs = handlers.to_vec();
             hs.push(handler.clone());
@@ -3536,6 +3547,7 @@ pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> Tagged
                 body_def,
                 binds,
                 handlers: Rc::from(hs),
+                sig,
             }
         }
         other => other,
