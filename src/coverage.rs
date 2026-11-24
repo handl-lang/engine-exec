@@ -500,9 +500,7 @@ impl CoverageSession {
                         let mut acc: std::collections::BTreeMap<u32, u64> =
                             std::collections::BTreeMap::new();
                         for (&prepared, &n) in &s.line_hits {
-                            if let Some(Some(orig)) =
-                                map.get(prepared.saturating_sub(1) as usize)
-                            {
+                            if let Some(Some(orig)) = map.get(prepared.saturating_sub(1) as usize) {
                                 *acc.entry(*orig).or_insert(0) += n;
                             }
                         }
@@ -529,9 +527,7 @@ impl CoverageSession {
                                 // source's provenance map.
                                 let file_line = s.spec.line_map.as_ref().and_then(|map| {
                                     let pl = s.line_of(d.start);
-                                    map.get(pl.saturating_sub(1) as usize)
-                                        .copied()
-                                        .flatten()
+                                    map.get(pl.saturating_sub(1) as usize).copied().flatten()
                                 });
                                 DeclReport {
                                     name: d.name.clone(),
@@ -1303,11 +1299,11 @@ mod tests {
         assert_eq!(
             m.into_vec(),
             vec![
-                None,        // `do {`
-                Some(10),    // `f := 1;`
-                Some(20),    // `g :=`
-                Some(21),    // `  2;` — contiguous interior line
-                None,        // `}`
+                None,     // `do {`
+                Some(10), // `f := 1;`
+                Some(20), // `g :=`
+                Some(21), // `  2;` — contiguous interior line
+                None,     // `}`
             ]
         );
     }
@@ -1319,10 +1315,7 @@ mod tests {
         m.push("b := 2;\n", Some(7)); // continues line 1 — no entry
         // `b := 2;` shares prepared line 1; the \n ends it.
         m.push_lines("x\ny\n", &[Some(4), None]);
-        assert_eq!(
-            m.into_vec(),
-            vec![Some(3), Some(4), None]
-        );
+        assert_eq!(m.into_vec(), vec![Some(3), Some(4), None]);
     }
 
     #[test]
@@ -1330,8 +1323,7 @@ mod tests {
         let session = CoverageSession::new();
         session.install_local();
         // Prepared text: line 1 generated, lines 2-3 map to file 10-11.
-        let src = "do {\nf := 1\ng := 2\n}"
-            .to_string();
+        let src = "do {\nf := 1\ng := 2\n}".to_string();
         let mut map = OriginLineMap::new();
         map.push("do {\n", None);
         map.push("f := 1\n", Some(10));
