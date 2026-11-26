@@ -269,6 +269,33 @@ pub trait ImportResolver {
         self.resolve_import(path)
             .map(|v| Rc::new(TaggedValue::from(v)))
     }
+
+    /// The `import *` / `import * as alias` / bare `import "path"` splice
+    /// namespace: the module's record of **declared exports** only.
+    ///
+    /// Named imports (`from "path" import name`, `import { a, b }`)
+    /// resolve through [`resolve_import_tagged`](Self::resolve_import_tagged)
+    /// and may project any field of the module record; the star forms
+    /// bind only what the module explicitly `export`ed — a module with no
+    /// `export` declarations yields an empty namespace (I-007 option b).
+    ///
+    /// Default: [`resolve_import_tagged`](Self::resolve_import_tagged) —
+    /// resolvers whose bindings record already *is* the declared-export
+    /// surface (host module deps, single-record modules) need no override.
+    /// Resolvers that also expose implicit module-record fields (the
+    /// runtime's `ModuleLoader`, whose no-`export` modules evaluate to an
+    /// all-bindings/trailing-record value) override this to return the
+    /// exports-only view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LangError`] as [`resolve_import_tagged`](Self::resolve_import_tagged).
+    fn resolve_import_namespace_tagged(
+        &self,
+        path: &str,
+    ) -> Result<Rc<TaggedValue>, LangError> {
+        self.resolve_import_tagged(path)
+    }
 }
 
 #[cfg(test)]

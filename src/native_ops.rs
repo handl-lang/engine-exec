@@ -2772,14 +2772,28 @@ pub fn apply_native_op(
             let resolver = ctx.import_resolver().ok_or_else(|| {
                 LangError::engine("import: no import resolver configured".to_string())
             })?;
+            // Star forms (`import "path"`, `from "path" import *`,
+            // `from "path" import * as alias`) bind the module's
+            // *declared exports* — `resolve_import_namespace_tagged`
+            // (I-007): a module with no `export` declarations yields an
+            // empty namespace. Named imports keep projecting the full
+            // module record via `resolve_import_tagged`.
+            let star_form = match names_val.as_ref() {
+                Some(v) if v.as_array().is_some() => false,
+                Some(v) => v.as_str().map_or(true, |n| n == "*"),
+                None => true,
+            };
             // The tagged path hands back the resolver's cached record as a
             // shared `Rc` — named-projected exports are `Rc`-cheap clones
             // into the importer's scope rather than deep `Value`
             // reconstructions per import (see
             // `ImportResolver::resolve_import_tagged`).
-            let bindings = resolver
-                .resolve_import_tagged(&path)
-                .map_err(|e| LangError::engine(format!("import \"{}\": {}", path, e)))?;
+            let bindings = if star_form {
+                resolver.resolve_import_namespace_tagged(&path)
+            } else {
+                resolver.resolve_import_tagged(&path)
+            }
+            .map_err(|e| LangError::engine(format!("import \"{}\": {}", path, e)))?;
             let export_field = |name: &str| match &*bindings {
                 TaggedValue::Obj(map) => map.get(name).cloned(),
                 _ => None,
