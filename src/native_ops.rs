@@ -374,8 +374,11 @@ pub enum OpService {
 /// minted arrow stores and apply-time pattern matching interprets;
 /// `names` is then the flattened bound-name set (for capture exclusion),
 /// `rest` is `None` (rest bindings live inside the patterns), and
-/// `array_pattern` is set when the params are a single `sequence`
-/// pattern so call sites keep the array argument whole.
+/// `array_pattern` is set when the params node *is* a single `sequence`
+/// pattern (`[x, y] ~>`) so call sites keep the packed argument list
+/// whole — a paren-wrapped pattern (`([x, y]) ~>`) is a params list
+/// whose pattern param consumes one call argument, so the flag stays
+/// `false` there (`Language::param_single_sequence`).
 #[derive(Debug)]
 pub struct ClosureParams {
     /// Bound parameter names — one per positional param for plain
@@ -383,7 +386,9 @@ pub struct ClosureParams {
     pub names: Vec<String>,
     /// Rest/variadic param name (`[a, ...rest] ~> body`), plain path only.
     pub rest: Option<String>,
-    /// Whether the arrow consumes a single array argument whole.
+    /// Whether the arrow consumes the packed argument list whole
+    /// (bare `[x, y] ~>` sequence params); call sites skip the
+    /// single-array-arg unpack when set.
     pub array_pattern: bool,
     /// `{"__ast__": …}` params subtree when destructured patterns are
     /// present (`param_defs` on the minted arrow); `None` otherwise.
