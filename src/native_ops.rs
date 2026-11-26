@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use crate::ImportResolver;
 use crate::pattern_match::is_ctor_object;
-use handl_language::{AstRef, LangError, Value};
+use handl_language::{Ast, AstRef, LangError, Language, Value};
 use handl_value::{
     Sym, TaggedValue, cell_comp_axis, cell_compose, cell2_comp_v, cell2_id, cell2_src, cell2_tgt,
     cell2_whisker, either_left, either_right, is_either_left, is_either_right, pair, pair_fst,
@@ -363,6 +363,65 @@ pub enum OpService {
     HandlerStack,
 }
 
+/// Resolved closure parameters — the `closure` op's view of a params
+/// node, shared by every eval engine.
+///
+/// For plain `var`/`type-annot` params this is exactly
+/// `Language::param_names` + `is_array_pattern`. When the params contain
+/// destructuring patterns (`([x, y]) ~>`, `({a, b}) ~>`, `[x, [y, z]] ~>`)
+/// `param_defs` carries the params-node subtree as a `{"__ast__": …}`
+/// value — the same self-describing encoding `body_def` uses — which the
+/// minted arrow stores and apply-time pattern matching interprets;
+/// `names` is then the flattened bound-name set (for capture exclusion),
+/// `rest` is `None` (rest bindings live inside the patterns), and
+/// `array_pattern` is set when the params are a single `sequence`
+/// pattern so call sites keep the array argument whole.
+#[derive(Debug)]
+pub struct ClosureParams {
+    /// Bound parameter names — one per positional param for plain
+    /// params, or every name the patterns bind (flattened).
+    pub names: Vec<String>,
+    /// Rest/variadic param name (`[a, ...rest] ~> body`), plain path only.
+    pub rest: Option<String>,
+    /// Whether the arrow consumes a single array argument whole.
+    pub array_pattern: bool,
+    /// `{"__ast__": …}` params subtree when destructured patterns are
+    /// present (`param_defs` on the minted arrow); `None` otherwise.
+    pub param_defs: Option<TaggedValue>,
+}
+
+/// Resolve a params node into [`ClosureParams`] — the shared
+/// implementation every engine's `closure_params_at` delegates to.
+///
+/// Plain params keep the `param_names`/`is_array_pattern` path
+/// byte-for-byte; pattern params mint `param_defs` from
+/// `Ast::subtree(params_ref)` + `ast_value` and report the flattened
+/// bound names via `param_bound_names`.
+pub fn resolve_closure_params(
+    lang: &Language,
+    ast: &Ast,
+    params_ref: AstRef,
+) -> Result<ClosureParams, LangError> {
+    let node = ast.at(params_ref)?;
+    if !lang.param_contains_patterns(ast, node) {
+        let (names, rest) = lang.param_names(ast, node)?;
+        return Ok(ClosureParams {
+            names,
+            rest,
+            array_pattern: lang.is_array_pattern(node),
+            param_defs: None,
+        });
+    }
+    let names = lang.param_bound_names(ast, node)?;
+    let sub = ast.subtree(params_ref)?;
+    Ok(ClosureParams {
+        names,
+        rest: None,
+        array_pattern: lang.param_single_sequence(ast, params_ref),
+        param_defs: Some(TaggedValue::from(handl_language::ast_value(&sub))),
+    })
+}
+
 /// Engine-specific globals the shared ops need.
 ///
 /// Each exec backend implements this once; the op *semantics* then live in
@@ -498,19 +557,16 @@ pub trait NativeOpCtx {
     /// `Language`; the op applies its payload heuristic.
     fn literal_child_at(&mut self, parent: AstRef, role: &str, child: AstRef) -> Option<bool>;
 
-    /// `Language::param_names` + `Language::is_array_pattern` on the
-    /// params-pattern node at `r` — the `closure` op's resolution of a
-    /// `params` child into `(fixed_names, rest_name, is_array_pattern)`
+    /// `Language::param_names`/`is_array_pattern` (+ destructured-pattern
+    /// resolution) on the params-pattern node at `r` — the `closure` op's
+    /// resolution of a `params` child into [`ClosureParams`]
     /// (ADR-0081 data-driven via `pattern_role`/variadic metadata).
     ///
     /// # Errors
     ///
     /// Returns `Err` when the node is missing, the engine has no
     /// `Language`, or the params shape is unresolvable.
-    fn closure_params_at(
-        &mut self,
-        r: AstRef,
-    ) -> Result<(Vec<String>, Option<String>, bool), LangError>;
+    fn closure_params_at(&mut self, r: AstRef) -> Result<ClosureParams, LangError>;
 
     /// The `body_def` a minted `closure` carries (ADR-0106): the body
     /// subtree as a self-describing `{"__ast__": <Ast>}` value with every
@@ -1158,46 +1214,52 @@ pub fn apply_native_op(
                 return Ok(None);
             }
             let payload = ctx.node_payload().cloned().unwrap_or(Value::Null);
-            let (params, rest, body, array_pattern) = if let (Some(p), Some(b)) = (
-                payload.get("params").and_then(|v| v.as_array()),
-                payload.get("body").and_then(|v| v.as_u64()),
-            ) {
-                let p_names: Vec<String> = p
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .ok_or_else(|| {
-                                LangError::engine("closure: param must be a string".to_string())
-                            })
-                            .map(String::from)
-                    })
-                    .collect::<Result<_, _>>()?;
-                let rest_name = payload
-                    .get("rest")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                (p_names, rest_name, b as usize, false)
-            } else if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
-                let params_role = ctx.child_role_index("params").unwrap_or(0);
-                let body_role = ctx.child_role_index("body").unwrap_or(1);
-                let param_idx = children
-                    .get(params_role)
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| LangError::engine("closure: missing param child".to_string()))?
-                    as usize;
-                let body_idx = children
-                    .get(body_role)
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| LangError::engine("closure: missing body child".to_string()))?
-                    as usize;
-                let (param_names, rest_name, array_pattern) =
-                    ctx.closure_params_at(AstRef::new(param_idx))?;
-                (param_names, rest_name, body_idx, array_pattern)
-            } else {
-                return Err(LangError::engine(
-                    "closure: missing params/body in payload".to_string(),
-                ));
-            };
+            let (params, rest, body, array_pattern, param_defs) =
+                if let (Some(p), Some(b)) = (
+                    payload.get("params").and_then(|v| v.as_array()),
+                    payload.get("body").and_then(|v| v.as_u64()),
+                ) {
+                    let p_names: Vec<String> = p
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .ok_or_else(|| {
+                                    LangError::engine("closure: param must be a string".to_string())
+                                })
+                                .map(String::from)
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let rest_name = payload
+                        .get("rest")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    (p_names, rest_name, b as usize, false, None)
+                } else if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
+                    let params_role = ctx.child_role_index("params").unwrap_or(0);
+                    let body_role = ctx.child_role_index("body").unwrap_or(1);
+                    let param_idx = children
+                        .get(params_role)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| LangError::engine("closure: missing param child".to_string()))?
+                        as usize;
+                    let body_idx = children
+                        .get(body_role)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| LangError::engine("closure: missing body child".to_string()))?
+                        as usize;
+                    let cp = ctx.closure_params_at(AstRef::new(param_idx))?;
+                    (
+                        cp.names,
+                        cp.rest,
+                        body_idx,
+                        cp.array_pattern,
+                        cp.param_defs,
+                    )
+                } else {
+                    return Err(LangError::engine(
+                        "closure: missing params/body in payload".to_string(),
+                    ));
+                };
             let captured = ctx.env_capture();
             // Free-variable collection: keep only the bindings the body
             // can actually reference. Unfiltered collection snapshots the
@@ -1279,6 +1341,7 @@ pub fn apply_native_op(
                     params: Rc::from(params),
                     rest: rest.map(Rc::from),
                     array_pattern,
+                    param_defs: param_defs.map(Rc::new),
                     body_def: body_def_rc,
                     binds: Rc::new(binds),
                     handlers: Rc::from(Vec::new()),
@@ -2417,6 +2480,7 @@ pub fn apply_native_op(
                         params,
                         rest,
                         array_pattern,
+                        param_defs,
                         body_def,
                         binds,
                         handlers,
@@ -2440,6 +2504,13 @@ pub fn apply_native_op(
                     "binds" => Ok((TaggedValue::Obj(binds), false)),
                     "handlers" => Ok((TaggedValue::Arr(handlers), false)),
                     "array_pattern" => Ok((TaggedValue::Bool(array_pattern), false)),
+                    "param_defs" => Ok((
+                        param_defs
+                            .as_ref()
+                            .map(|pd| pd.as_ref().clone())
+                            .unwrap_or(TaggedValue::Null),
+                        false,
+                    )),
                     // P-013 T-148: the atom's declared signature, when the
                     // arrow carries one (host atoms); `null` otherwise.
                     "sig" => Ok((
@@ -3533,6 +3604,7 @@ pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> Tagged
             params,
             rest,
             array_pattern,
+            param_defs,
             body_def,
             binds,
             handlers,
@@ -3544,6 +3616,7 @@ pub fn attach_carried_handler(val: TaggedValue, handler: &TaggedValue) -> Tagged
                 params,
                 rest,
                 array_pattern,
+                param_defs,
                 body_def,
                 binds,
                 handlers: Rc::from(hs),
