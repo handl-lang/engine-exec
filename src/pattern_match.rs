@@ -11,6 +11,8 @@
 //!    optional `rest` node → positional match, `...rest` captures tail.
 //! 5. **Object destructuring** — `object` node with `entry` children +
 //!    optional `rest` node → key match, `...rest` captures unmatched keys.
+//!    A bare `var` child is the `{x, y}` shorthand: field `x` binds var
+//!    `x` (the `entry{key: x, value: x}` reading).
 //! 6. **Tag pattern** — `call` node with a `var` callee (the tag name) and
 //!    `var` arg nodes (the binders): `ok(v)`, `err(e)`. Dispatches on
 //!    `__tag__` identity and binds args to payload fields (ADR-0077).
@@ -450,6 +452,17 @@ fn try_object_pattern(
                 key_val.as_str().unwrap_or("").to_string()
             };
             entries.push((key, val_idx));
+        } else if is_binder_node(ctx.lang(), child_node)
+            && let Some(name) = child_node.payload.as_str()
+        {
+            // Shorthand entry (`{x, y}`): the parser leaves the `var`
+            // itself as the object child — key and binder are the same
+            // name, the `entry{key: x, value: x}` reading the grammar
+            // spec gives. Wildcards bind nothing and require no field,
+            // matching `param_bound_names`/`bind_pattern_node`.
+            if !is_wildcard_name(name) {
+                entries.push((name.to_string(), idx));
+            }
         }
     }
 
