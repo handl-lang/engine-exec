@@ -529,9 +529,14 @@ fn try_tag_pattern(
             LangError::engine_node("tag pattern: missing callee".to_string(), pattern_node)
         })? as usize;
     let callee_node = ast.at(AstRef::new(callee_idx))?;
-    let tag_name = callee_node.payload.as_str().ok_or_else(|| {
-        LangError::engine_node("tag pattern: callee is not a var".to_string(), pattern_node)
-    })?;
+    // The callee is either a bare `var` (the tag/ctor leaf name) or a
+    // qualified `F.c` `field-access` — `Family.ctor(…)` patterns. The
+    // qualified form yields the ctor leaf name for dispatch plus the
+    // family record's `__former__` sym as an identity qualifier.
+    let (tag_name, family_sym) = match callee_node.payload.as_str() {
+        Some(s) => (s.to_string(), None),
+        None => qualified_tag_callee(ast, ctx, callee_node, pattern_node)?,
+    };
     // Check scrutinee is a tagged value with matching tag name.
     let scrut_obj = match scrut {
         TaggedValue::Obj(o) => o,
@@ -539,6 +544,10 @@ fn try_tag_pattern(
     };
     let scrut_tag = scrut_obj.get("__tag__").and_then(|v| v.as_str());
     match scrut_tag {
+        // `__tag__` is a bare string — a qualified `F.c` callee still
+        // dispatches on the leaf name here (legacy tagged values carry
+        // no family identity to qualify against); a `__tag__` miss
+        // falls through to the ctor-object check like the bare form.
         Some(t) if t == tag_name => {}
         // Canonical constructor object (ADR-0152 §2): `{"__ctor__": sym,
         // <arg fields…>, "type": {__former__, indices}}` minted by the
@@ -550,7 +559,15 @@ fn try_tag_pattern(
         // scrutinee with neither `__tag__` nor a `__ctor__` sym cannot
         // match a tag/ctor pattern at all.
         _ => {
-            return try_ctor_object_pattern(ast, pattern_node, children, tag_name, scrut_obj, ctx);
+            return try_ctor_object_pattern(
+                ast,
+                pattern_node,
+                children,
+                &tag_name,
+                family_sym.as_deref(),
+                scrut_obj,
+                ctx,
+            );
         }
     }
     // Collect payload fields (excluding __tag__), sorted alphabetically
@@ -613,6 +630,100 @@ pub(crate) fn is_ctor_object(v: &TaggedValue) -> bool {
     matches!(v, TaggedValue::Obj(o) if matches!(o.get("__ctor__"), Some(TaggedValue::Sym(_))))
 }
 
+/// Extract the dispatch name and optional family qualifier from a
+/// qualified tag-pattern callee — a `field-access` node `F.c` (the
+/// `Family.ctor` spelling; `j.Json.JStr` nests field-accesses).
+///
+/// Returns `(ctor_leaf_name, family_former_sym)`:
+///
+/// - The leaf name comes from the node's `field` payload (the
+///   `payload_extract` the grammar declares) with a last-child `var`
+///   fallback.
+/// - The family qualifier is the `target` expression evaluated to a
+///   runtime value; when it is a `data` family record its `__former__`
+///   [`Sym`] is returned so [`try_ctor_object_pattern`] can require
+///   ctor-object identity (`type.__former__`) to match — `Maybe.just`
+///   must not match `Other.just` values. A target that does not
+///   evaluate to a family record yields `None`: the pattern degrades
+///   to leaf-name dispatch, the same permissiveness the bare `just(…)`
+///   spelling has always had.
+///
+/// Any other callee shape is the pre-qualified error — `tag pattern:
+/// callee is not a var`.
+fn qualified_tag_callee(
+    ast: &Ast,
+    ctx: &mut impl PatternMatchCtx,
+    callee_node: &AstNode,
+    pattern_node: &AstNode,
+) -> Result<(String, Option<std::rc::Rc<handl_value::Sym>>), LangError> {
+    let lang = ctx.lang();
+    let is_field_access = lang
+        .map(|l| {
+            matches!(
+                l.child_role_index(&callee_node.kind, "field"),
+                Ok(Some(_))
+            ) || matches!(l.child_role_index(&callee_node.kind, "target"), Ok(Some(_)))
+        })
+        .unwrap_or(false)
+        || matches!(callee_node.kind.as_str(), "field-access" | "field_access");
+    if !is_field_access {
+        return Err(LangError::engine_node(
+            "tag pattern: callee is not a var".to_string(),
+            pattern_node,
+        ));
+    }
+    let children = callee_node
+        .payload
+        .get("children")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            LangError::engine_node(
+                "tag pattern: qualified callee missing children".to_string(),
+                callee_node,
+            )
+        })?;
+    // `field` payload first (the grammar's `payload_extract`); the
+    // field-role child `var` is the fallback.
+    let mut leaf = callee_node
+        .payload
+        .get("field")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if leaf.is_none() {
+        let field_idx = children
+            .get(child_idx(lang, callee_node, "field", 1))
+            .and_then(|v| v.as_u64())
+            .map(|i| i as usize);
+        if let Some(fi) = field_idx
+            && let Ok(field_node) = ast.at(AstRef::new(fi))
+        {
+            leaf = field_node.payload.as_str().map(str::to_string);
+        }
+    }
+    let Some(leaf) = leaf else {
+        return Err(LangError::engine_node(
+            "tag pattern: qualified callee has no field name".to_string(),
+            pattern_node,
+        ));
+    };
+    // The `target` role (index 0) names the family expression — evaluate
+    // it and keep its `__former__` sym when it is a `data` family
+    // record. Eval failure or a non-family value degrades to `None`
+    // (leaf-name dispatch).
+    let family_sym = children
+        .get(child_idx(lang, callee_node, "target", 0))
+        .and_then(|v| v.as_u64())
+        .and_then(|i| ctx.eval_pattern_node(ast, AstRef::new(i as usize)).ok())
+        .and_then(|v| match v {
+            TaggedValue::Obj(o) => match o.get("__former__") {
+                Some(TaggedValue::Sym(s)) => Some(std::rc::Rc::clone(s)),
+                _ => None,
+            },
+            _ => None,
+        });
+    Ok((leaf, family_sym))
+}
+
 /// Constructor-object pattern (`Ctor(binder, …)` against a
 /// `{"__ctor__": sym, <fields…>, "type": …}` scrutinee — ADR-0152 §2).
 ///
@@ -631,11 +742,17 @@ pub(crate) fn is_ctor_object(v: &TaggedValue) -> bool {
 /// resolve to an arrow the binders fall back to the tag-pattern
 /// convention — alphabetical field order, excluding the nominal
 /// `__ctor__`/`type` members.
+/// `family_sym` is the qualified-callee qualifier (`Family.ctor`):
+/// when `Some`, the scrutinee's `type.__former__` sym must be the same
+/// nominal (handle equality) — `Maybe.just` never matches `Other.just`
+/// values. `None` (bare `just(…)` callee, or a qualifier that did not
+/// resolve to a family record) keeps leaf-name dispatch.
 fn try_ctor_object_pattern(
     ast: &Ast,
     pattern_node: &AstNode,
     children: &[Value],
     tag_name: &str,
+    family_sym: Option<&handl_value::Sym>,
     scrut_obj: &FxHashMap<Rc<str>, TaggedValue>,
     ctx: &mut impl PatternMatchCtx,
 ) -> Result<bool, LangError> {
@@ -645,6 +762,18 @@ fn try_ctor_object_pattern(
     };
     if ctor_name != tag_name {
         return Ok(false);
+    }
+    if let Some(fsym) = family_sym {
+        // Qualified dispatch: the ctor object's `type` link must name
+        // the same family former the `F.c` target evaluated to.
+        let former_matches = matches!(
+            scrut_obj.get("type"),
+            Some(TaggedValue::Obj(t))
+                if matches!(t.get("__former__"), Some(TaggedValue::Sym(s)) if s.handle() == fsym.handle())
+        );
+        if !former_matches {
+            return Ok(false);
+        }
     }
     // Collect binder nodes (the `args` role onward; index 1 on canonical
     // `call`) — same layout `try_tag_pattern` uses.
@@ -658,13 +787,28 @@ fn try_ctor_object_pattern(
             Ok(idx as usize)
         })
         .collect::<Result<_, _>>()?;
-    // Declared argument order from the constructor arrow's `params`;
-    // sorted-field fallback (minus the nominal members) when the callee
-    // does not resolve to an arrow.
-    let declared: Option<Vec<String>> = match ctx.scope_value(tag_name) {
-        Some(TaggedValue::Arrow { params, .. }) => Some(params.iter().cloned().collect()),
-        _ => None,
-    };
+    // Declared argument order from the constructor arrow's `params`.
+    // The callee expression itself evaluates to that arrow — this
+    // covers the qualified `F.c` spelling, where the bare ctor name is
+    // not in scope (the family record field is). The bare-name
+    // `scope_value` lookup remains the fallback for engines/contexts
+    // where pattern-node eval is unavailable or fails.
+    let callee_idx = children
+        .get(child_idx(ctx.lang(), pattern_node, "callee", 0))
+        .and_then(|v| v.as_u64())
+        .map(|i| i as usize);
+    let declared: Option<Vec<String>> = callee_idx
+        .and_then(|i| ctx.eval_pattern_node(ast, AstRef::new(i)).ok())
+        .and_then(|v| match v {
+            TaggedValue::Arrow { params, .. } => Some(params.iter().cloned().collect()),
+            _ => None,
+        })
+        .or_else(|| match ctx.scope_value(tag_name) {
+            Some(TaggedValue::Arrow { params, .. }) => {
+                Some(params.iter().cloned().collect())
+            }
+            _ => None,
+        });
     let mut sorted_fields: Vec<(&Rc<str>, &TaggedValue)> = Vec::new();
     if declared.is_none() {
         sorted_fields = scrut_obj
